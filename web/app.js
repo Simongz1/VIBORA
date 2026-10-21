@@ -1,6 +1,6 @@
 'use strict';
 const $=s=>document.querySelector(s);
-const descriptions={mesh:['▦','Mesh','GeneratedMesh'],variable:['φ','Scalar field','Lagrange · first order'],diffusion:['∇','Diffusion','MOOSE Diffusion'],boundary:['⊣','Boundary condition','DirichletBC'],solver:['ƒ','Solver','Steady / Transient'],output:['↗','Results','Exodus output']};
+const descriptions={component:['◇','MOOSE component','Any registered physics'],mesh:['▦','Mesh','GeneratedMesh'],variable:['φ','Scalar field','Lagrange · first order'],diffusion:['∇','Diffusion','MOOSE Diffusion'],boundary:['⊣','Boundary condition','DirichletBC'],solver:['ƒ','Solver','Steady / Transient'],output:['↗','Results','Exodus output']};
 let catalog=[], graph={version:1,nodes:[],edges:[]}, selected=null, pending=null, generated='', drag=null, resolvedGraph=null, generationPending=false;
 const clone=x=>JSON.parse(JSON.stringify(x));
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
@@ -8,9 +8,19 @@ function status(t){$('#status').textContent=t;}
 function invalidate(){generated='';resolvedGraph=null;try{localStorage.setItem('vibora-draft',JSON.stringify(graph));}catch(e){}$('#issues').replaceChildren(el('p','Assembly changed. Check dependencies again.','muted'));scheduleCheck();}
 let timer;
 function scheduleCheck(){clearTimeout(timer);timer=setTimeout(()=>check(false,true),650);}
-function spec(k){return catalog.find(x=>x.kind===k);}
+function spec(k){return catalog.find(x=>x.kind===k)||(k==='component'?{kind:k,params:{},inputs:[{name:'dependency',type:'object'}],outputs:[{name:'object',type:'object'}]}:undefined);}
 function node(kind,x=80,y=60,label){return {id:'b_'+crypto.randomUUID().replaceAll('-',''),kind,label:label||descriptions[kind][1],params:clone(spec(kind).params),physics:'',method:'',implementation:'',x,y};}
-function add(kind,label){const n=node(kind,60+graph.nodes.length%4*215,80+Math.floor(graph.nodes.length/4)*200,label);graph.nodes.push(n);selected=n.id;render();inspect();invalidate();}
+const mooseCategories=['Materials','ICs','BCs','Postprocessors','Kernels','Variables','AuxVariables','AuxKernels','Functions','UserObjects','VectorPostprocessors','ScalarKernels','AuxScalarKernels','InterfaceKernels','DGKernels','Constraints','Mesh','MeshModifiers','Executioner','Preconditioning','Outputs','MultiApps','Transfers','Controls','Dampers','Adaptivity'];
+function sizeCanvas(){
+ const width=Math.max(1500,...graph.nodes.map(n=>n.x+240)),height=Math.max(1000,...graph.nodes.map(n=>n.y+240));
+ $('#canvas').style.width=width+'px';$('#canvas').style.height=height+'px';
+}
+function add(kind,label,properties={}){
+ const view=$('#viewport');let x=view.scrollLeft+Math.max(20,(view.clientWidth-188)/2),y=view.scrollTop+40;
+ while(graph.nodes.some(n=>Math.abs(n.x-x)<195&&Math.abs(n.y-y)<130))y+=150;
+ const n=Object.assign(node(kind,x,y,label),properties);graph.nodes.push(n);selected=n.id;render();inspect();invalidate();
+ document.getElementById(n.id).scrollIntoView({block:'nearest',inline:'nearest'});status('Added '+n.label);return n;
+}
 function drawWires(){
  const svg=$('#wires');svg.replaceChildren();
  for(const e of graph.edges){
@@ -24,19 +34,21 @@ function drawWires(){
  }
 }
 function render(){
- const solver=graph.nodes.find(n=>n.kind==='solver');$('#model-title').textContent=(solver?.params.type||'Steady')+' diffusion / unit domain';
+ sizeCanvas();
+ if(document.activeElement!==$('#model-request'))$('#model-request').value=graph.request||'';
+ const solver=graph.nodes.find(n=>n.kind==='solver');$('#model-title').textContent=graph.title||'MOOSE model assembly';
  $('#nodes').replaceChildren();$('#counts').textContent=graph.nodes.length+' blocks · '+graph.edges.length+' connections';
  for(const n of graph.nodes){
   const card=el('section',undefined,'node'+(selected===n.id?' selected':''));card.id=n.id;card.style.left=n.x+'px';card.style.top=n.y+'px';
-  const head=el('div',undefined,'node-head');head.append(el('b',n.label),el('small',n.kind==='solver'?(n.params.type||'Steady')+' · '+(n.params.solve_type||'PJFNK'):descriptions[n.kind][2]));card.append(head);
+  const head=el('div',undefined,'node-head');head.append(el('b',n.label),el('small',n.kind==='solver'?(n.params.type||'Steady')+' · '+(n.params.solve_type||'PJFNK'):(n.category||descriptions[n.kind][2])+(n.object_type?' · '+n.object_type:'')));card.append(head);
   head.onpointerdown=e=>{if(e.button!==0)return;selected=n.id;inspect();document.querySelectorAll('.node').forEach(c=>c.classList.toggle('selected',c.id===n.id));drag={n,x:e.clientX,y:e.clientY,ox:n.x,oy:n.y};head.setPointerCapture(e.pointerId);};
-  head.onpointermove=e=>{if(!drag||drag.n!==n)return;n.x=Math.max(5,Math.min(1300,drag.ox+e.clientX-drag.x));n.y=Math.max(5,Math.min(850,drag.oy+e.clientY-drag.y));card.style.left=n.x+'px';card.style.top=n.y+'px';drawWires();};
-  head.onpointerup=()=>{drag=null;};
+  head.onpointermove=e=>{if(!drag||drag.n!==n)return;n.x=Math.max(5,drag.ox+e.clientX-drag.x);n.y=Math.max(5,drag.oy+e.clientY-drag.y);card.style.left=n.x+'px';card.style.top=n.y+'px';drawWires();};
+  head.onpointerup=()=>{drag=null;sizeCanvas();invalidate();};
   head.onpointercancel=()=>{drag=null;};
   const ports=el('div',undefined,'ports');
   for(const dir of ['in','out']){
    const col=el('div');
-   for(const p of spec(n.kind)[dir==='in'?'inputs':'outputs']){
+   for(const p of (n[dir==='in'?'inputs':'outputs']||spec(n.kind)[dir==='in'?'inputs':'outputs'])){
     const b=el('button',p.name,'port '+(dir==='out'?'output':'')+(pending&&pending.id===n.id&&pending.port===p.name?' pending':''));
     b.id=n.id+'-'+dir+'-'+p.name;b.title=p.type+' '+(dir==='in'?'input':'output');
     b.onclick=()=>{
@@ -53,18 +65,30 @@ function render(){
 }
 function field(parent,label,value,onchange,type='text'){
  const l=el('label',label),input=el(type==='textarea'?'textarea':'input');
- if(type!=='textarea')input.type=type;if(type==='number')input.step='any';input.value=value;input.oninput=()=>{onchange(type==='number'?Number(input.value):input.value);invalidate();render();};l.append(input);parent.append(l);
+ if(type!=='textarea')input.type=type;if(type==='number')input.step='any';input.value=value;input.oninput=()=>{try{onchange(type==='number'?Number(input.value):input.value);input.setCustomValidity('');invalidate();render();}catch(e){input.setCustomValidity(e.message);status(e.message);}};l.append(input);parent.append(l);
 }
 function inspect(){
  const box=$('#inspector');box.replaceChildren();const n=graph.nodes.find(n=>n.id===selected);
  if(!n){box.append(el('h2','Select a block'),el('p','Select a block to edit its properties.','muted'));return;}
  box.append(el('h2',descriptions[n.kind][1]));
  field(box,'Label',n.label,v=>n.label=v);
- for(const [k,v] of Object.entries(n.params))field(box,k,v,v=>n.params[k]=v,typeof v==='number'?'number':'text');
+ if(n.kind==='component'){
+  field(box,'MOOSE category',n.category||'',v=>n.category=v);
+  field(box,'MOOSE object type (optional)',n.object_type||'',v=>n.object_type=v);
+  field(box,'Object parameters (JSON)',JSON.stringify(n.params,null,2),v=>{const p=JSON.parse(v);if(!p||Array.isArray(p)||typeof p!=='object')throw Error('Parameters must be a JSON object.');n.params=p;},'textarea');
+ }
+ else for(const [k,v] of Object.entries(n.params))field(box,k,v,v=>n.params[k]=v,typeof v==='number'?'number':'text');
+ for(const direction of ['inputs','outputs']){
+  const ports=n[direction]||spec(n.kind)[direction];
+  field(box,direction+' (name:type, …)',ports.map(p=>p.name+':'+p.type).join(', '),value=>{
+   const parsed=value.trim()?value.split(',').map(item=>{const [name,type]=item.trim().split(':');if(!name||!type||!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)||!/^[A-Za-z_][A-Za-z0-9_]*$/.test(type))throw Error('Use port:type identifiers.');return {name,type};}):[];
+   n[direction]=parsed;
+  });
+ }
  field(box,'Physics',n.physics||'',v=>n.physics=v,'textarea');
  field(box,'Numerical method',n.method||'',v=>n.method=v,'textarea');
  field(box,'Implementation requirements',n.implementation||'',v=>n.implementation=v,'textarea');
- const note=el('p','Descriptions drive the coding agent. Example: Transient diffusion, dt = 0.1, end time = 2, backward Euler, initial u = 0. Generate to implement and review the changes.','muted');box.append(note);
+ const note=el('p','Descriptions drive a MOOSE-aware coding agent. Specify the physics and numerical requirements; the agent checks registered objects and asks before implementing custom C++.','muted');box.append(note);
  const connections=el('div',undefined,'connections');connections.append(el('b','Connections · click to remove'));
  for(const e of graph.edges.filter(e=>e.from===n.id||e.to===n.id)){
   const a=graph.nodes.find(n=>n.id===e.from),b=graph.nodes.find(n=>n.id===e.to),btn=el('button',(a?.label||e.from)+' → '+(b?.label||e.to)+' ×');
@@ -80,7 +104,7 @@ async function check(generate=false,quiet=false){
  if(generate){clearTimeout(timer);generationPending=true;$('#generate').disabled=true;status('Coding agent is implementing block descriptions…');}
 
  try{
-  const response=await fetch('/api/'+(generate?'generate':'validate'),{method:'POST',headers:{'Content-Type':'application/json'},body:snapshot});
+  const response=await fetch((generate?'/api/generate':'/api/graph/check'),{method:'POST',headers:{'Content-Type':'application/json'},body:snapshot});
   const data=await response.json();if(rid!==requestId||snapshot!==JSON.stringify(graph)){status('Assembly changed during generation. Generate again to use current descriptions.');return;}
   $('#issues').replaceChildren();
   if(data.valid)$('#issues').append(el('div','✓ Graph connections are consistent. Generate to implement descriptions.','issue success'));
@@ -123,7 +147,7 @@ $('#file').onchange=async e=>{
    if(!n||typeof n.id!=='string'||!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(n.id)||ids.has(n.id)||!spec(n.kind)||!n.params||typeof n.params!=='object'||Array.isArray(n.params))throw Error('Invalid or duplicate block.');
    ids.add(n.id);if(typeof n.label!=='string')n.label=descriptions[n.kind][1];
    for(const key of ['physics','method','implementation'])if(typeof n[key]!=='string')n[key]='';
-   n.x=Number.isFinite(n.x)?Math.max(5,Math.min(1300,n.x)):50;n.y=Number.isFinite(n.y)?Math.max(5,Math.min(850,n.y)):50;
+   n.x=Number.isFinite(n.x)?Math.max(5,n.x):50;n.y=Number.isFinite(n.y)?Math.max(5,n.y):50;
   }
   for(const edge of g.edges)if(!edge||!['from','out','to','in'].every(k=>typeof edge[k]==='string'))throw Error('Invalid connection.');
   graph=g;selected=null;pending=null;$('#model-title').textContent=file.name;render();inspect();invalidate();
@@ -133,9 +157,9 @@ $('#example').onclick=()=>{if(!graph.nodes.length||confirm('Replace the current 
 $('#custom').onclick=()=>$('#creator').showModal();
 $('#create').onclick=e=>{
  if(!$('#new-label').value.trim()){e.preventDefault();$('#new-label').focus();return;}
- add($('#new-kind').value,$('#new-label').value.trim());const n=graph.nodes.find(n=>n.id===selected);n.physics=$('#new-physics').value;n.method=$('#new-method').value;inspect();
+ add($('#new-kind').value,$('#new-label').value.trim(),{category:$('#new-category').value.trim(),object_type:$('#new-object-type').value.trim(),physics:$('#new-physics').value,method:$('#new-method').value});
 };
-$('#close-preview').onclick=()=>$('#preview').close();$('#download').onclick=()=>download('diffusion.i',generated,'text/plain');
+$('#close-preview').onclick=()=>$('#preview').close();$('#download').onclick=()=>download('model.i',generated,'text/plain');
 $('#apply-resolved').onclick=()=>{if(!resolvedGraph)return;graph=clone(resolvedGraph);render();inspect();try{localStorage.setItem('vibora-draft',JSON.stringify(graph));}catch(e){}status('Implemented settings applied to blocks.');};
 $('#save-resolved').onclick=()=>download('vibora-resolved.json',JSON.stringify(resolvedGraph,null,2),'application/json');
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){pending=null;render();status('Ready');}});
@@ -143,10 +167,12 @@ window.addEventListener('resize',drawWires);
 async function start(){
  try{
   const res=await fetch('/api/catalog');if(!res.ok)throw Error();catalog=await res.json();
-  for(const kind of ['mesh','variable','diffusion','boundary','solver','output']){
+  for(const kind of ['component','mesh','variable','diffusion','boundary','solver','output']){
    const [symbol,title,desc]=descriptions[kind],b=el('button',undefined,'library-item'),label=el('div',title);label.append(el('small',desc));b.append(el('span',symbol,'symbol'),label);b.onclick=()=>add(kind);$('#catalog').append(b);
    const option=el('option',title);option.value=kind;$('#new-kind').append(option);
   }
+  for(const category of mooseCategories){const option=el('option');option.value=category;$('#moose-categories').append(option);}
+  for(const category of ['Materials','ICs','BCs','Postprocessors','Kernels','AuxVariables','AuxKernels']){const b=el('button','＋ '+category,'library-item');b.onclick=()=>add('component',category,{category});$('#catalog').append(b);}
   const draft=localStorage.getItem('vibora-draft');
   if(draft){try{const g=JSON.parse(draft);if(!Array.isArray(g.nodes)||!Array.isArray(g.edges)||g.nodes.some(n=>!spec(n.kind)))throw Error();graph=g;render();inspect();scheduleCheck();}catch(e){example();}}else example();
  }catch(e){status('Cannot load block catalog. Start the C++ backend.');}

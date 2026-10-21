@@ -1,0 +1,20 @@
+{
+  "moose_executable": "/depot/aamp/data/gonz1075/moose/ml/ml-opt",
+  "moose_dir": "/depot/aamp/data/gonz1075/moose/moose",
+  "scheduler": {
+    "account": "alta",
+    "partition": "a30",
+    "qos": "standby",
+    "time": "00:20:00",
+    "cpus": 2,
+    "memory": "8G",
+    "gpus": 1
+  },
+  "max_repairs": 2,
+  "ollama_url": "http://127.0.0.1:11434",
+  "openai_compatible_url": "http://127.0.0.1:8000/v1",
+  "toolchain_bin": [
+    "/apps/spack/gilbreth-r9/apps/openmpi/4.1.6-gcc-11.5.0-w7wc45k/bin",
+    "/apps/spack/gilbreth-r9/apps/cuda/12.6.0-gcc-11.5.0-a7cv7sp/bin"
+  ]
+}

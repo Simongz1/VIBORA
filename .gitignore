@@ -7,3 +7,16 @@ __pycache__/
 /third_party/*.hpp
 
 .agent-token
+
+.vibora/
+*.swp
+/moose_app/build/
+/moose_app/lib/
+/moose_app/*-opt
+/moose_app/include/base/*Revision.h
+*.o
+*.lo
+*.la
+*.d
+
+/config.local.json

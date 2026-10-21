@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import secrets
 import shlex
+import types
 import subprocess
 import tempfile
 import threading
@@ -96,10 +97,16 @@ def main():
     if not args.token_file and not args.ssh_host:
         parser.error("Provide --ssh-host to manage the tunnel, or --token-file for an external tunnel.")
     token=Path(args.token_file).read_text().strip() if args.token_file else secrets.token_hex(32)
+    host=args.ssh_host or os.environ.get('VIBORA_SSH_HOST','gonz1075@gilbreth.rcac.purdue.edu')
+    source=subprocess.run(['ssh','-o','BatchMode=yes',host,'cat '+shlex.quote(args.remote_dir+'/scripts/workflow_engine.py')],text=True,capture_output=True,timeout=30)
+    if source.returncode:raise RuntimeError('Cannot load MOOSE workflow engine: '+source.stderr)
+    module=types.ModuleType('vibora_workflow')
+    exec(compile(source.stdout,'workflow_engine.py','exec'),module.__dict__)
+    engine=module.Engine(args)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args): pass
         def do_POST(self):
-            if self.path!="/resolve": self.send_error(404);return
+            if self.path not in ("/resolve","/models","/jobs/start","/jobs/status","/jobs/approve","/jobs/reject","/graph/check"): self.send_error(404);return
             if not hmac.compare_digest(self.headers.get("Authorization",""),"Bearer "+token):
                 self.send_error(401);return
             if self.headers.get("Content-Type")!="application/json":
@@ -107,6 +114,15 @@ def main():
             try: length=int(self.headers.get("Content-Length","0"))
             except ValueError: self.send_error(400);return
             if not 0<length<=1024*1024:self.send_error(413);return
+            if self.path!="/resolve":
+                try:
+                    payload=json.loads(self.rfile.read(length))
+                    response=engine.request(self.path,payload)
+                    data=json.dumps(response).encode();self.send_response(200)
+                except Exception as e:
+                    data=json.dumps({"error":str(e)}).encode();self.send_response(400)
+                self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(data)))
+                self.end_headers();self.wfile.write(data);return
             if not LOCK.acquire(blocking=False):self.send_error(503,"Coding agent busy. Retry shortly.");return
             try:
                 graph=json.loads(self.rfile.read(length))

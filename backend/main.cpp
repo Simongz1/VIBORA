@@ -9,9 +9,11 @@
 #include <cmath>
 using json = nlohmann::json;
 #include "intent.hpp"
+#include "workflow.hpp"
 struct Port { std::string name, type; };
 struct Spec { std::vector<Port> inputs, outputs; };
 const std::map<std::string, Spec> specs = {
+ {"component", {{{"dependency","object"}}, {{"object","object"}}}},
  {"mesh", {{}, {{"mesh","mesh"}}}},
  {"variable", {{{"mesh","mesh"}}, {{"field","field"}}}},
  {"diffusion", {{{"field","field"}}, {{"operator","operator"}}}},
@@ -199,6 +201,7 @@ int main(int argc,char**argv) {
  if(argc>1) port=std::stoi(argv[1]);
  if(argc>2) root=argv[2];
  httplib::Server server;
+ register_workflow(server);
  server.new_task_queue=[] { return new httplib::ThreadPool(4); };
  server.set_payload_max_length(1024*1024);
  server.set_read_timeout(10,0);server.set_write_timeout(310,0);

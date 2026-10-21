@@ -148,6 +148,6 @@ class BackendTests(unittest.TestCase):
         self.assertIn('offline',p.stderr)
     def test_web(self):
         with urllib.request.urlopen(self.url('/')) as r:self.assertIn(b'VIBORA',r.read())
-        with urllib.request.urlopen(self.url('/api/catalog')) as r:self.assertEqual(len(json.load(r)),6)
+        with urllib.request.urlopen(self.url('/api/catalog')) as r:self.assertEqual(len(json.load(r)),7)
 
 if __name__=='__main__': unittest.main()
