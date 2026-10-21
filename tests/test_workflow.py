@@ -53,6 +53,55 @@ class WorkflowTests(unittest.TestCase):
   response=e.public(j)
   for k in ('graph','context','coding_prompt','package'):self.assertNotIn(k,response)
 
+class FakeClaudeSDK:
+ class AnthropicError(Exception):pass
+ class APIConnectionError(AnthropicError):pass
+ class APIStatusError(AnthropicError):
+  def __init__(self,message,status_code=500):super().__init__(message);self.message=message;self.status_code=status_code
+ class AuthenticationError(APIStatusError):pass
+ class RateLimitError(APIStatusError):pass
+class FakeClaudeClient:
+ def __init__(self,stop_reason='end_turn',text='{"objects":["Kernels/ADHeatConduction"],"questions":[]}',ids=()):
+  self.requests=[];self.ids=ids;client=self
+  class Stream:
+   def __enter__(self):return self
+   def __exit__(self,*args):return False
+   def get_final_message(self):
+    return types.SimpleNamespace(stop_reason=stop_reason,stop_details=None,content=[types.SimpleNamespace(type='text',text=text)])
+  def stream(**kwargs):client.requests.append(kwargs);return Stream()
+  self.beta=types.SimpleNamespace(messages=types.SimpleNamespace(stream=stream))
+  self.models=types.SimpleNamespace(list=lambda **kwargs:[types.SimpleNamespace(id=i) for i in client.ids])
+ def with_options(self,**kwargs):return self
+class ClaudeProviderTests(unittest.TestCase):
+ def use(self,client):
+  original=engine.claude_client;engine.claude_client=lambda:(FakeClaudeSDK,client)
+  self.addCleanup(setattr,engine,'claude_client',original)
+  return FakeEngine()
+ def test_structured_request_uses_schema_and_fallback(self):
+  client=FakeClaudeClient();e=self.use(client)
+  answer=e.llm({'provider':'anthropic','id':'claude-opus-5-5'},'plan this',engine.DISCOVERY)
+  self.assertEqual(answer['objects'],['Kernels/ADHeatConduction'])
+  request=client.requests[0]
+  self.assertEqual(request['output_config']['format'],{'type':'json_schema','schema':engine.DISCOVERY})
+  self.assertEqual(request['fallbacks'],'default');self.assertEqual(request['betas'],['server-side-fallback-2026-07-01'])
+ def test_fallback_omitted_for_models_without_server_fallback(self):
+  client=FakeClaudeClient();self.use(client).llm({'provider':'anthropic','id':'claude-haiku-5-5'},'p',engine.DISCOVERY)
+  self.assertNotIn('fallbacks',client.requests[0]);self.assertNotIn('betas',client.requests[0])
+ def test_refusal_and_truncation_fail_the_job_step(self):
+  for reason in ('refusal','max_tokens'):
+   with self.assertRaises(RuntimeError):
+    self.use(FakeClaudeClient(stop_reason=reason)).llm({'provider':'anthropic','id':'claude-opus-5-5'},'p',engine.DISCOVERY)
+ def test_only_advertised_supported_models_listed(self):
+  e=self.use(FakeClaudeClient(ids=['claude-haiku-5-5','claude-opus-5-5','claude-3-haiku']))
+  listed=[m['id'] for m in engine.Engine.models(e)['models'] if m['provider']=='anthropic']
+  self.assertEqual(listed,['claude-opus-5-5','claude-haiku-5-5'])
+ def test_missing_sdk_or_key_reported_as_provider_status(self):
+  original=engine.claude_client
+  def missing():raise RuntimeError('Set ANTHROPIC_API_KEY before starting the bridge')
+  engine.claude_client=missing;self.addCleanup(setattr,engine,'claude_client',original)
+  status=engine.Engine.models(FakeEngine())['providers']['anthropic']
+  self.assertIn('ANTHROPIC_API_KEY',status)
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[
