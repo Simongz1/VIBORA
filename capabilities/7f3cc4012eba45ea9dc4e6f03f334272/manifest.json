@@ -1,0 +1,268 @@
+{
+  "id": "7f3cc4012eba45ea9dc4e6f03f334272",
+  "summary": "I wrote one new custom material, `ComputeLagrangianCompressibleNeoHookeanStress`, plus the full model input and three numerical tests. Nothing has been compiled or run yet, and I couldn't check the base-class header in your MOOSE fork, so the C++ is unverified (details at the end).\n\n**What the material computes**\n- It is derived from `ComputeLagrangianStressPK1` and registered under `ViboraPhysicsApp`.\n- The stored energy is W = K/2\u00b7(J\u22121)\u00b2 + G/2\u00b7(tr b \u2212 3). The bulk modulus K and shear modulus G are read from the material properties `bulk` and `shear`, which `GenericConstantMaterial` supplies as 1 GPa each.\n- The stress is P = G\u00b7F + K\u00b7J(J\u22121)\u00b7F\u207b\u1d40, with its exact tangent dP/dF written out by hand.\n- Setting `deviatoric_form = isochoric` switches the shear term to G/2\u00b7(J^{-2/3}\u00b7tr b \u2212 3), also with an exact tangent.\n- The base class turns this into the Cauchy stress and tangent that the updated-Lagrangian kernel uses, so no other custom code was needed.\n- It stops with an error if large kinematics is off. If J \u2264 0 it throws an exception so the time step is cut.\n\n**How the graph maps to the input**\n- **Mesh:** 2D, 20\u00d720, default [0,1]\u00b2 domain, no length unit.\n- **Variables:** `disp_x` and `disp_y`, first-order Lagrange.\n- **Stress Divergence:** the built-in solid-mechanics setup (`Physics/SolidMechanics/QuasiStatic`) with the new kernel system, the UPDATED (updated Lagrangian) formulation and finite strain. There are no inertia terms, so the run is transient but quasi-static.\n- **Boundary conditions:** u\u00b7n = 0 becomes a fixed value of 0 on the normal displacement, which is exact for these straight, axis-aligned edges. `disp_y` is fixed on top and bottom; `disp_x` is fixed on the right and on the left (\"Left Push\", whose value is 0).\n- **Solver:** PJFNK (the stored value), implicit Euler, dt = 0.1, 10 steps, full SMP preconditioner with LU.\n- **Results:** Exodus output.\n\n**Decisions and changes**\n- **Absolute solver tolerance changed from 1e-10 to 1e-3.** The 1e-10 value was my own assumption in the earlier plan, not yours. With moduli of 1e9, each element contributes forces of about 1e7, so rounding error alone leaves a residual around 1e-8 to 1e-7 that can never drop below 1e-10. 1e-3 is still about 1e-10 of the element force scale.\n- **The 'Kernels' block is left out.** Its temperature input isn't connected to anything, it has no output, and the model only asks for mechanics.\n- **2D is treated as plane strain** (no out-of-plane stretch), so tr b includes an out-of-plane value of 1.\n- **1 GPa is taken as 1e9, assuming SI pressure units.**\n\n**What to expect when you run it**\n- The displacement will stay at zero: every boundary value is 0, including \"Left Push\", and there is no load.\n- With the shear term as you wrote it, the undeformed state carries a uniform stress of G\u00b7I = 1e9 in every direction. Because it is uniform it is in equilibrium and moves nothing.\n\n**Tests** (each writes values to CSV; checks are on the final row)\n1. `literal_uniaxial_strain`: a 4\u00d74 mesh stretched to \u03bb = 1.1 in x with y held fixed, using G = 1 and K = 2 so the two moduli can be told apart. It uses NEWTON so your hand-written tangent actually drives convergence. The exact answer is a uniform deformation: \u03c3xx = G\u03bb + K(\u03bb\u22121) = 1.3, \u03c3yy = \u03c3zz = G/\u03bb + K(\u03bb\u22121) = 1.1090909091, and disp_x at the centre = 0.05.\n2. `isochoric_uniaxial_strain`: the same setup with the isochoric form. Expected \u03c3xx = 0.2 + 0.14\u00b7G\u00b7\u03bb^{-5/3} = 0.3194373687 and \u03c3yy = \u03c3zz = 0.1402813156.\n3. `reference_state_main_model`: the main model as specified plus output columns. Expected u = 0 and \u03c3xx = \u03c3yy = \u03c3zz = 1e9.\n\n**Unverified assumptions about your MOOSE fork**\n- The new code uses `_d_F_stab_d_F_ust` and `_pk1_jacobian_bypass_fbar`. I assumed these come from a base class, because `ComputeLagrangianStressCustomPK2` uses them. If that class declares them itself, the build will fail.\n- I set the tangent as dP/dF multiplied by `_d_F_stab_d_F_ust`, following `ComputeLagrangianStressCustomPK2`. Without volume-locking correction (`stabilize_strain`, off here) that factor is the identity, so the convention doesn't matter for this model. If you turn that correction on, check which convention your fork's PK1 base class expects.",
+  "objects": [
+    "GeneratedMesh",
+    "MooseVariable",
+    "QuasiStaticSolidMechanicsPhysics (Physics/SolidMechanics/QuasiStatic, new_system=true, formulation=UPDATED, strain=FINITE)",
+    "UpdatedLagrangianStressDivergence (created by action)",
+    "ComputeLagrangianStrain (created by action)",
+    "GenericConstantMaterial",
+    "ComputeLagrangianCompressibleNeoHookeanStress (new, derives from ComputeLagrangianStressPK1)",
+    "DirichletBC",
+    "SMP",
+    "Transient",
+    "Exodus",
+    "RankTwoAux (tests)",
+    "ElementAverageValue (tests)",
+    "PointValue (tests)",
+    "CSV (tests)"
+  ],
+  "tests": [
+    {
+      "name": "literal_uniaxial_strain",
+      "input": "[GlobalParams]\n  displacements = 'disp_x disp_y'\n[]\n\n[Mesh]\n  type = GeneratedMesh\n  dim = 2\n  nx = 4\n  ny = 4\n[]\n\n[Variables]\n  [disp_x]\n  []\n  [disp_y]\n  []\n[]\n\n[Physics]\n  [SolidMechanics]\n    [QuasiStatic]\n      [all]\n        new_system = true\n        formulation = UPDATED\n        strain = FINITE\n      []\n    []\n  []\n[]\n\n[AuxVariables]\n  [sxx]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n  [syy]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n  [szz]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n[]\n\n[AuxKernels]\n  [sxx]\n    type = RankTwoAux\n    variable = sxx\n    rank_two_tensor = cauchy_stress\n    index_i = 0\n    index_j = 0\n  []\n  [syy]\n    type = RankTwoAux\n    variable = syy\n    rank_two_tensor = cauchy_stress\n    index_i = 1\n    index_j = 1\n  []\n  [szz]\n    type = RankTwoAux\n    variable = szz\n    rank_two_tensor = cauchy_stress\n    index_i = 2\n    index_j = 2\n  []\n[]\n\n[BCs]\n  [left]\n    type = DirichletBC\n    variable = disp_x\n    boundary = left\n    value = 0\n  []\n  [right]\n    type = DirichletBC\n    variable = disp_x\n    boundary = right\n    value = 0.1\n  []\n  [tb]\n    type = DirichletBC\n    variable = disp_y\n    boundary = 'top bottom'\n    value = 0\n  []\n[]\n\n[Materials]\n  [consts]\n    type = GenericConstantMaterial\n    prop_names = 'bulk shear'\n    prop_values = '2 1'\n  []\n  [stress]\n    type = ComputeLagrangianCompressibleNeoHookeanStress\n    bulk_modulus = bulk\n    shear_modulus = shear\n    deviatoric_form = literal\n  []\n[]\n\n[Preconditioning]\n  [smp]\n    type = SMP\n    full = true\n  []\n[]\n\n[Postprocessors]\n  [sxx_avg]\n    type = ElementAverageValue\n    variable = sxx\n  []\n  [syy_avg]\n    type = ElementAverageValue\n    variable = syy\n  []\n  [szz_avg]\n    type = ElementAverageValue\n    variable = szz\n  []\n  [ux_mid]\n    type = PointValue\n    variable = disp_x\n    point = '0.5 0.5 0'\n  []\n  [uy_mid]\n    type = PointValue\n    variable = disp_y\n    point = '0.5 0.5 0'\n  []\n[]\n\n[Executioner]\n  type = Transient\n  solve_type = NEWTON\n  line_search = none\n  dt = 1\n  num_steps = 1\n  petsc_options_iname = '-pc_type'\n  petsc_options_value = 'lu'\n  nl_rel_tol = 1e-10\n  nl_abs_tol = 1e-12\n  nl_max_its = 30\n[]\n\n[Outputs]\n  csv = true\n[]\n",
+      "checks": [
+        {
+          "column": "sxx_avg",
+          "expected": 1.3,
+          "tolerance": 1e-07
+        },
+        {
+          "column": "syy_avg",
+          "expected": 1.1090909090909,
+          "tolerance": 1e-07
+        },
+        {
+          "column": "szz_avg",
+          "expected": 1.1090909090909,
+          "tolerance": 1e-07
+        },
+        {
+          "column": "ux_mid",
+          "expected": 0.05,
+          "tolerance": 1e-09
+        },
+        {
+          "column": "uy_mid",
+          "expected": 0,
+          "tolerance": 1e-09
+        }
+      ]
+    },
+    {
+      "name": "isochoric_uniaxial_strain",
+      "input": "[GlobalParams]\n  displacements = 'disp_x disp_y'\n[]\n\n[Mesh]\n  type = GeneratedMesh\n  dim = 2\n  nx = 4\n  ny = 4\n[]\n\n[Variables]\n  [disp_x]\n  []\n  [disp_y]\n  []\n[]\n\n[Physics]\n  [SolidMechanics]\n    [QuasiStatic]\n      [all]\n        new_system = true\n        formulation = UPDATED\n        strain = FINITE\n      []\n    []\n  []\n[]\n\n[AuxVariables]\n  [sxx]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n  [syy]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n  [szz]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n[]\n\n[AuxKernels]\n  [sxx]\n    type = RankTwoAux\n    variable = sxx\n    rank_two_tensor = cauchy_stress\n    index_i = 0\n    index_j = 0\n  []\n  [syy]\n    type = RankTwoAux\n    variable = syy\n    rank_two_tensor = cauchy_stress\n    index_i = 1\n    index_j = 1\n  []\n  [szz]\n    type = RankTwoAux\n    variable = szz\n    rank_two_tensor = cauchy_stress\n    index_i = 2\n    index_j = 2\n  []\n[]\n\n[BCs]\n  [left]\n    type = DirichletBC\n    variable = disp_x\n    boundary = left\n    value = 0\n  []\n  [right]\n    type = DirichletBC\n    variable = disp_x\n    boundary = right\n    value = 0.1\n  []\n  [tb]\n    type = DirichletBC\n    variable = disp_y\n    boundary = 'top bottom'\n    value = 0\n  []\n[]\n\n[Materials]\n  [consts]\n    type = GenericConstantMaterial\n    prop_names = 'bulk shear'\n    prop_values = '2 1'\n  []\n  [stress]\n    type = ComputeLagrangianCompressibleNeoHookeanStress\n    bulk_modulus = bulk\n    shear_modulus = shear\n    deviatoric_form = isochoric\n  []\n[]\n\n[Preconditioning]\n  [smp]\n    type = SMP\n    full = true\n  []\n[]\n\n[Postprocessors]\n  [sxx_avg]\n    type = ElementAverageValue\n    variable = sxx\n  []\n  [syy_avg]\n    type = ElementAverageValue\n    variable = syy\n  []\n  [szz_avg]\n    type = ElementAverageValue\n    variable = szz\n  []\n  [ux_mid]\n    type = PointValue\n    variable = disp_x\n    point = '0.5 0.5 0'\n  []\n[]\n\n[Executioner]\n  type = Transient\n  solve_type = NEWTON\n  line_search = none\n  dt = 1\n  num_steps = 1\n  petsc_options_iname = '-pc_type'\n  petsc_options_value = 'lu'\n  nl_rel_tol = 1e-10\n  nl_abs_tol = 1e-12\n  nl_max_its = 30\n[]\n\n[Outputs]\n  csv = true\n[]\n",
+      "checks": [
+        {
+          "column": "sxx_avg",
+          "expected": 0.3194373687,
+          "tolerance": 1e-06
+        },
+        {
+          "column": "syy_avg",
+          "expected": 0.1402813156,
+          "tolerance": 1e-06
+        },
+        {
+          "column": "szz_avg",
+          "expected": 0.1402813156,
+          "tolerance": 1e-06
+        },
+        {
+          "column": "ux_mid",
+          "expected": 0.05,
+          "tolerance": 1e-09
+        }
+      ]
+    },
+    {
+      "name": "reference_state_main_model",
+      "input": "[GlobalParams]\n  displacements = 'disp_x disp_y'\n[]\n\n[Mesh]\n  type = GeneratedMesh\n  dim = 2\n  nx = 20\n  ny = 20\n[]\n\n[Variables]\n  [disp_x]\n  []\n  [disp_y]\n  []\n[]\n\n[Physics]\n  [SolidMechanics]\n    [QuasiStatic]\n      [all]\n        new_system = true\n        formulation = UPDATED\n        strain = FINITE\n      []\n    []\n  []\n[]\n\n[AuxVariables]\n  [sxx]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n  [syy]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n  [szz]\n    order = CONSTANT\n    family = MONOMIAL\n  []\n[]\n\n[AuxKernels]\n  [sxx]\n    type = RankTwoAux\n    variable = sxx\n    rank_two_tensor = cauchy_stress\n    index_i = 0\n    index_j = 0\n  []\n  [syy]\n    type = RankTwoAux\n    variable = syy\n    rank_two_tensor = cauchy_stress\n    index_i = 1\n    index_j = 1\n  []\n  [szz]\n    type = RankTwoAux\n    variable = szz\n    rank_two_tensor = cauchy_stress\n    index_i = 2\n    index_j = 2\n  []\n[]\n\n[BCs]\n  [no_vertical_displacement]\n    type = DirichletBC\n    variable = disp_y\n    boundary = 'top bottom'\n    value = 0\n  []\n  [no_horizontal_displacement]\n    type = DirichletBC\n    variable = disp_x\n    boundary = right\n    value = 0\n  []\n  [left_push]\n    type = DirichletBC\n    variable = disp_x\n    boundary = left\n    value = 0\n  []\n[]\n\n[Materials]\n  [material_constants]\n    type = GenericConstantMaterial\n    prop_names = 'bulk shear'\n    prop_values = '1e9 1e9'\n    constant_on = ELEMENT\n  []\n  [stress]\n    type = ComputeLagrangianCompressibleNeoHookeanStress\n    bulk_modulus = bulk\n    shear_modulus = shear\n    deviatoric_form = literal\n  []\n[]\n\n[Preconditioning]\n  [smp]\n    type = SMP\n    full = true\n  []\n[]\n\n[Postprocessors]\n  [sxx_avg]\n    type = ElementAverageValue\n    variable = sxx\n  []\n  [syy_avg]\n    type = ElementAverageValue\n    variable = syy\n  []\n  [szz_avg]\n    type = ElementAverageValue\n    variable = szz\n  []\n  [ux_mid]\n    type = PointValue\n    variable = disp_x\n    point = '0.5 0.5 0'\n  []\n  [uy_mid]\n    type = PointValue\n    variable = disp_y\n    point = '0.5 0.5 0'\n  []\n[]\n\n[Executioner]\n  type = Transient\n  solve_type = PJFNK\n  scheme = implicit-euler\n  dt = 0.1\n  num_steps = 10\n  petsc_options_iname = '-pc_type'\n  petsc_options_value = 'lu'\n  nl_rel_tol = 1e-8\n  nl_abs_tol = 1e-3\n[]\n\n[Outputs]\n  csv = true\n[]\n",
+      "checks": [
+        {
+          "column": "sxx_avg",
+          "expected": 1000000000,
+          "tolerance": 1
+        },
+        {
+          "column": "syy_avg",
+          "expected": 1000000000,
+          "tolerance": 1
+        },
+        {
+          "column": "szz_avg",
+          "expected": 1000000000,
+          "tolerance": 1
+        },
+        {
+          "column": "ux_mid",
+          "expected": 0,
+          "tolerance": 1e-10
+        },
+        {
+          "column": "uy_mid",
+          "expected": 0,
+          "tolerance": 1e-10
+        }
+      ]
+    }
+  ],
+  "files": [
+    "include/materials/ComputeLagrangianCompressibleNeoHookeanStress.h",
+    "src/materials/ComputeLagrangianCompressibleNeoHookeanStress.C"
+  ],
+  "verification": {
+    "passed": true,
+    "phase": "tests",
+    "build": {
+      "returncode": 0,
+      "stdout": "Rebuilding symlinks in /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/build/header_symlinks\nCreating Unity Directory /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/build/unity_src\nLinking Test Library /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/test/lib/libvibora_physics_test-opt.la...\nCreating Unity /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/build/unity_src/materials_Unity.C\nCreating Unity /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/build/unity_src/base_Unity.C\nDevice Linking Kokkos Objects...\nCompiling C++ (in opt mode) /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/src/main.C...\nCompiling C++ (in opt mode) /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/build/unity_src/materials_Unity.C...\nCompiling C++ (in opt mode) /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/build/unity_src/base_Unity.C...\nLinking Library /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/lib/libvibora_physics-opt.la...\nLinking Executable /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/vibora_physics-opt...\n",
+      "stderr": "\u001b[33mWARNING: Failed to initialize PreMake for version checking; this may be ignored but may suggest an environment issue.\n\nTraceback (most recent call last):\n  File \"/depot/aamp/data/gonz1075/moose/moose/framework/../scripts/premake.py\", line 21, in __init__\n    from versioner import Versioner\n  File \"/depot/aamp/data/gonz1075/moose/moose/scripts/versioner.py\", line 32, in <module>\n    import jinja2\nModuleNotFoundError: No module named 'jinja2'\n\u001b[0m\nTraceback (most recent call last):\n  File \"/depot/aamp/data/gonz1075/moose/moose/framework/../scripts/premake.py\", line 273, in <module>\n    PreMake().check()\n  File \"/depot/aamp/data/gonz1075/moose/moose/framework/../scripts/premake.py\", line 28, in __init__\n    self.packages = Versioner().get_packages(\"HEAD\")\nUnboundLocalError: local variable 'Versioner' referenced before assignment\nmake: [/depot/aamp/data/gonz1075/moose/moose/framework/moose.mk:551: prebuild] Error 1 (ignored)\n"
+    },
+    "validation": {
+      "returncode": 0,
+      "stdout": "\n\u001b[36m\n*** Info ***\n/depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/model.i:26.7:\nThe following occurred in the Action 'all' of type QuasiStaticSolidMechanicsPhysics.\n\nSolidMechanics Action: selecting 'incremental finite strain' formulation.\u001b[39m\n",
+      "stderr": "[gilbreth-b004.rcac.purdue.edu:137591] mca_base_component_repository_open: unable to open mca_btl_openib: libosmcomp.so.12: cannot open shared object file: No such file or directory (ignored)\n[gilbreth-b004.rcac.purdue.edu:137591] mca_base_component_repository_open: unable to open mca_coll_hcoll: libhcoll.so.1: cannot open shared object file: No such file or directory (ignored)\nSyntax OK\n"
+    },
+    "tests": [
+      {
+        "name": "literal_uniaxial_strain",
+        "passed": true,
+        "checks": [
+          {
+            "column": "sxx_avg",
+            "expected": 1.3,
+            "tolerance": 1e-07,
+            "actual": 1.3,
+            "passed": true
+          },
+          {
+            "column": "syy_avg",
+            "expected": 1.1090909090909,
+            "tolerance": 1e-07,
+            "actual": 1.1090909090909,
+            "passed": true
+          },
+          {
+            "column": "szz_avg",
+            "expected": 1.1090909090909,
+            "tolerance": 1e-07,
+            "actual": 1.1090909090909,
+            "passed": true
+          },
+          {
+            "column": "ux_mid",
+            "expected": 0.05,
+            "tolerance": 1e-09,
+            "actual": 0.05,
+            "passed": true
+          },
+          {
+            "column": "uy_mid",
+            "expected": 0,
+            "tolerance": 1e-09,
+            "actual": -2.4201662945876e-17,
+            "passed": true
+          }
+        ],
+        "log": {
+          "returncode": 0,
+          "stdout": "\n\u001b[36m\n*** Info ***\n/depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/tests/literal_uniaxial_strain/test.i:22.7:\nThe following occurred in the Action 'all' of type QuasiStaticSolidMechanicsPhysics.\n\nSolidMechanics Action: selecting 'incremental finite strain' formulation.\u001b[39m\nFramework Information:\nMOOSE Version:           git commit 07b49de938 on 2026-08-28\nLibMesh Version:         90766057ef390adc9968b529e8ded2a87b0a77c7\nPETSc Version:           3.25.4\nSLEPc Version:           3.25.1\nLibtorch Version:        2.13.0\nCurrent Time:            Wed Oct 21 14:51:21 2026\nExecutable Timestamp:    Wed Oct 21 14:51:14 2026\n\nInput File(s):\n  /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/tests/literal_uniaxial_strain/test.i\n\nCommand Line Input Argument(s):\n  Outputs/csv=true\n  Outputs/file_base=result\n\nCheckpoint:\n  Wall Time Interval:      Every 3600 s\n  Checkpoint:              Outputs/checkpoint\n  # Checkpoints Kept:      2\n  Execute On:              TIMESTEP_END \n\nParallelism:\n  Num Processors:          1\n  Num Threads:             1\n\nMesh: \n  Parallel Type:           replicated\n  Mesh Dimension:          2\n  Spatial Dimension:       2\n  Nodes:                   25\n  Elems:                   16\n  Num Subdomains:          1\n\nNonlinear System:\n  Num DOFs:                50\n  Num Local DOFs:          50\n  Variables:               { \"disp_x\" \"disp_y\" } \n  Finite Element Types:    \"LAGRANGE\" \n  Approximation Orders:    \"FIRST\" \n\nAuxiliary System:\n  Num DOFs:                48\n  Num Local DOFs:          48\n  Variables:               { \"sxx\" \"syy\" \"szz\" } \n  Finite Element Types:    \"MONOMIAL\" \n  Approximation Orders:    \"CONSTANT\" \n\nExecution Information:\n  Executioner:             Transient\n  TimeStepper:             ConstantDT\n  TimeIntegrator(s):       ImplicitEuler\n  Solver Mode:             NEWTON \n  PETSc Preconditioner:    lu \n  MOOSE Preconditioner:    SMP \n\n\nTime Step 0, time = 0\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 1, time = 1, dt = 1\n 0 Nonlinear |R| = \u001b[32m5.612486e-01\u001b[39m\n      0 Linear |R| = \u001b[32m5.612486e-01\u001b[39m\n      1 Linear |R| = \u001b[32m2.392442e-16\u001b[39m\n 1 Nonlinear |R| = \u001b[32m3.488822e-16\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e+00 |   1.300000e+00 |   1.109091e+00 |   1.109091e+00 |   5.000000e-02 |  -2.420166e-17 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n",
+          "stderr": "[gilbreth-b004.rcac.purdue.edu:137655] mca_base_component_repository_open: unable to open mca_btl_openib: libosmcomp.so.12: cannot open shared object file: No such file or directory (ignored)\n[gilbreth-b004.rcac.purdue.edu:137655] mca_base_component_repository_open: unable to open mca_coll_hcoll: libhcoll.so.1: cannot open shared object file: No such file or directory (ignored)\n"
+        }
+      },
+      {
+        "name": "isochoric_uniaxial_strain",
+        "passed": true,
+        "checks": [
+          {
+            "column": "sxx_avg",
+            "expected": 0.3194373687,
+            "tolerance": 1e-06,
+            "actual": 0.31943736873049,
+            "passed": true
+          },
+          {
+            "column": "syy_avg",
+            "expected": 0.1402813156,
+            "tolerance": 1e-06,
+            "actual": 0.14028131563476,
+            "passed": true
+          },
+          {
+            "column": "szz_avg",
+            "expected": 0.1402813156,
+            "tolerance": 1e-06,
+            "actual": 0.14028131563476,
+            "passed": true
+          },
+          {
+            "column": "ux_mid",
+            "expected": 0.05,
+            "tolerance": 1e-09,
+            "actual": 0.05,
+            "passed": true
+          }
+        ],
+        "log": {
+          "returncode": 0,
+          "stdout": "\n\u001b[36m\n*** Info ***\n/depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/tests/isochoric_uniaxial_strain/test.i:22.7:\nThe following occurred in the Action 'all' of type QuasiStaticSolidMechanicsPhysics.\n\nSolidMechanics Action: selecting 'incremental finite strain' formulation.\u001b[39m\nFramework Information:\nMOOSE Version:           git commit 07b49de938 on 2026-08-28\nLibMesh Version:         90766057ef390adc9968b529e8ded2a87b0a77c7\nPETSc Version:           3.25.4\nSLEPc Version:           3.25.1\nLibtorch Version:        2.13.0\nCurrent Time:            Wed Oct 21 14:51:24 2026\nExecutable Timestamp:    Wed Oct 21 14:51:14 2026\n\nInput File(s):\n  /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/tests/isochoric_uniaxial_strain/test.i\n\nCommand Line Input Argument(s):\n  Outputs/csv=true\n  Outputs/file_base=result\n\nCheckpoint:\n  Wall Time Interval:      Every 3600 s\n  Checkpoint:              Outputs/checkpoint\n  # Checkpoints Kept:      2\n  Execute On:              TIMESTEP_END \n\nParallelism:\n  Num Processors:          1\n  Num Threads:             1\n\nMesh: \n  Parallel Type:           replicated\n  Mesh Dimension:          2\n  Spatial Dimension:       2\n  Nodes:                   25\n  Elems:                   16\n  Num Subdomains:          1\n\nNonlinear System:\n  Num DOFs:                50\n  Num Local DOFs:          50\n  Variables:               { \"disp_x\" \"disp_y\" } \n  Finite Element Types:    \"LAGRANGE\" \n  Approximation Orders:    \"FIRST\" \n\nAuxiliary System:\n  Num DOFs:                48\n  Num Local DOFs:          48\n  Variables:               { \"sxx\" \"syy\" \"szz\" } \n  Finite Element Types:    \"MONOMIAL\" \n  Approximation Orders:    \"CONSTANT\" \n\nExecution Information:\n  Executioner:             Transient\n  TimeStepper:             ConstantDT\n  TimeIntegrator(s):       ImplicitEuler\n  Solver Mode:             NEWTON \n  PETSc Preconditioner:    lu \n  MOOSE Preconditioner:    SMP \n\n\nTime Step 0, time = 0\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         |\n+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 1, time = 1, dt = 1\n 0 Nonlinear |R| = \u001b[32m5.450127e-01\u001b[39m\n      0 Linear |R| = \u001b[32m5.450127e-01\u001b[39m\n      1 Linear |R| = \u001b[32m3.042079e-16\u001b[39m\n 1 Nonlinear |R| = \u001b[32m2.195565e-02\u001b[39m\n      0 Linear |R| = \u001b[32m2.195565e-02\u001b[39m\n      1 Linear |R| = \u001b[32m1.040752e-17\u001b[39m\n 2 Nonlinear |R| = \u001b[32m6.163450e-05\u001b[39m\n      0 Linear |R| = \u001b[32m6.163450e-05\u001b[39m\n      1 Linear |R| = \u001b[32m1.570595e-20\u001b[39m\n 3 Nonlinear |R| = \u001b[32m4.772457e-10\u001b[39m\n      0 Linear |R| = \u001b[32m4.772457e-10\u001b[39m\n      1 Linear |R| = \u001b[32m1.494479e-25\u001b[39m\n 4 Nonlinear |R| = \u001b[32m3.598203e-16\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         |\n+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e+00 |   3.194374e-01 |   1.402813e-01 |   1.402813e-01 |   5.000000e-02 |\n+----------------+----------------+----------------+----------------+----------------+\n\n",
+          "stderr": "[gilbreth-b004.rcac.purdue.edu:137670] mca_base_component_repository_open: unable to open mca_btl_openib: libosmcomp.so.12: cannot open shared object file: No such file or directory (ignored)\n[gilbreth-b004.rcac.purdue.edu:137670] mca_base_component_repository_open: unable to open mca_coll_hcoll: libhcoll.so.1: cannot open shared object file: No such file or directory (ignored)\n"
+        }
+      },
+      {
+        "name": "reference_state_main_model",
+        "passed": true,
+        "checks": [
+          {
+            "column": "sxx_avg",
+            "expected": 1000000000,
+            "tolerance": 1,
+            "actual": 1000000000.0,
+            "passed": true
+          },
+          {
+            "column": "syy_avg",
+            "expected": 1000000000,
+            "tolerance": 1,
+            "actual": 1000000000.0,
+            "passed": true
+          },
+          {
+            "column": "szz_avg",
+            "expected": 1000000000,
+            "tolerance": 1,
+            "actual": 1000000000.0,
+            "passed": true
+          },
+          {
+            "column": "ux_mid",
+            "expected": 0,
+            "tolerance": 1e-10,
+            "actual": 0.0,
+            "passed": true
+          },
+          {
+            "column": "uy_mid",
+            "expected": 0,
+            "tolerance": 1e-10,
+            "actual": 0.0,
+            "passed": true
+          }
+        ],
+        "log": {
+          "returncode": 0,
+          "stdout": "\n\u001b[36m\n*** Info ***\n/depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/tests/reference_state_main_model/test.i:22.7:\nThe following occurred in the Action 'all' of type QuasiStaticSolidMechanicsPhysics.\n\nSolidMechanics Action: selecting 'incremental finite strain' formulation.\u001b[39m\nFramework Information:\nMOOSE Version:           git commit 07b49de938 on 2026-08-28\nLibMesh Version:         90766057ef390adc9968b529e8ded2a87b0a77c7\nPETSc Version:           3.25.4\nSLEPc Version:           3.25.1\nLibtorch Version:        2.13.0\nCurrent Time:            Wed Oct 21 14:51:27 2026\nExecutable Timestamp:    Wed Oct 21 14:51:14 2026\n\nInput File(s):\n  /depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/tests/reference_state_main_model/test.i\n\nCommand Line Input Argument(s):\n  Outputs/csv=true\n  Outputs/file_base=result\n\nCheckpoint:\n  Wall Time Interval:      Every 3600 s\n  Checkpoint:              Outputs/checkpoint\n  # Checkpoints Kept:      2\n  Execute On:              TIMESTEP_END \n\nParallelism:\n  Num Processors:          1\n  Num Threads:             1\n\nMesh: \n  Parallel Type:           replicated\n  Mesh Dimension:          2\n  Spatial Dimension:       2\n  Nodes:                   441\n  Elems:                   400\n  Num Subdomains:          1\n\nNonlinear System:\n  Num DOFs:                882\n  Num Local DOFs:          882\n  Variables:               { \"disp_x\" \"disp_y\" } \n  Finite Element Types:    \"LAGRANGE\" \n  Approximation Orders:    \"FIRST\" \n\nAuxiliary System:\n  Num DOFs:                1200\n  Num Local DOFs:          1200\n  Variables:               { \"sxx\" \"syy\" \"szz\" } \n  Finite Element Types:    \"MONOMIAL\" \n  Approximation Orders:    \"CONSTANT\" \n\nExecution Information:\n  Executioner:             Transient\n  TimeStepper:             ConstantDT\n  TimeIntegrator(s):       ImplicitEuler\n  Solver Mode:             Preconditioned JFNK \n  PETSc Preconditioner:    lu \n  MOOSE Preconditioner:    SMP \n\n\nTime Step 0, time = 0\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 1, time = 0.1, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 2, time = 0.2, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 3, time = 0.3, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 4, time = 0.4, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   4.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 5, time = 0.5, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   4.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   5.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 6, time = 0.6, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   4.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   5.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   6.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 7, time = 0.7, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   4.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   5.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   6.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   7.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 8, time = 0.8, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   4.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   5.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   6.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   7.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   8.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 9, time = 0.9, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   4.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   5.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   6.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   7.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   8.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   9.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n\nTime Step 10, time = 1, dt = 0.1\n 0 Nonlinear |R| = \u001b[32m7.118912e-07\u001b[39m\n\u001b[32m Solve Converged!\u001b[39m\n\n\nPostprocessor Values:\n+----------------+----------------+----------------+----------------+----------------+----------------+\n| time           | sxx_avg        | syy_avg        | szz_avg        | ux_mid         | uy_mid         |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n|   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   2.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   3.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   4.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   5.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   6.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   7.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   8.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   9.000000e-01 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n|   1.000000e+00 |   1.000000e+09 |   1.000000e+09 |   1.000000e+09 |   0.000000e+00 |   0.000000e+00 |\n+----------------+----------------+----------------+----------------+----------------+----------------+\n\n",
+          "stderr": "[gilbreth-b004.rcac.purdue.edu:137684] mca_base_component_repository_open: unable to open mca_btl_openib: libosmcomp.so.12: cannot open shared object file: No such file or directory (ignored)\n[gilbreth-b004.rcac.purdue.edu:137684] mca_base_component_repository_open: unable to open mca_coll_hcoll: libhcoll.so.1: cannot open shared object file: No such file or directory (ignored)\n"
+        }
+      }
+    ],
+    "executable": "/depot/aamp/data/gonz1075/vibora/.vibora/jobs/7f3cc4012eba45ea9dc4e6f03f334272/app/vibora_physics-opt"
+  },
+  "approved": {
+    "plan_hash": "da87bb66277b5510721bcbc52903ef21900e4d687fdfc611bf66e12901c72a02",
+    "approved_at": 1792608227.7519317,
+    "graph_hash": "9d3fa79a66cc6e5e8a41ed182e324d48d0ad5d09ea60754c2abd2821a7831250"
+  }
+}
