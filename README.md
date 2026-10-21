@@ -38,7 +38,7 @@ With a compiled MOOSE application registering the built-in objects:
 /path/to/moose-app-opt -i diffusion.i --check-input
 /path/to/moose-app-opt -i diffusion.i
 ```
-The existing moose/ checkout is preserved and excluded from this repository. No executable was found at moose/test/moose_test-opt during setup: an actual MOOSE parse/solve remains unverified. Input structure follows moose/test/tests/kernels/simple_diffusion/simple_diffusion.i at MOOSE commit 2c9d7a5e570501e440acc6faefb2a2866e897df6.
+The existing moose/ checkout is preserved and excluded from this repository. Installed executables are available at /depot/aamp/data/gonz1075/moose/moose/test/moose_test-opt and /depot/aamp/data/gonz1075/moose/ml/ml-opt (the user-provided MARLINS build). The GUI does not yet launch these executables; an actual MOOSE parse/solve remains unverified. Input structure follows moose/test/tests/kernels/simple_diffusion/simple_diffusion.i at MOOSE commit 2c9d7a5e570501e440acc6faefb2a2866e897df6.
 
 ## Architecture
 - web/: buildless editor, typed ports, import/export, input preview.
@@ -51,3 +51,8 @@ Dependency checking and coding roles currently use deterministic validation and 
 Custom metadata is descriptive, not executable. Supported roles: mesh, variable, diffusion, Dirichlet boundary, steady solver, output. The prototype requires one mesh, field, diffusion operator, solver, output, and at least one boundary. Generated meshes support 1D/2D. Edges are assembly dependencies, not physical transport or arbitrary coupled equations. Multiphysics, cyclic physical coupling, transients, variable coefficients, units checking, custom kernels, and multi-fidelity execution are future work.
 
 The backend has a bounded four-worker pool, 1 MB request limit, and limits of 500 blocks/2000 edges. Dependency traversal is linear in graph size. This is a small-model prototype, not a benchmarked large-model engine.
+
+## GUI typography and solid mechanics
+The interface uses Tahoma, with Arial and generic sans-serif fallbacks when Tahoma is unavailable. All VIBORA HTML, CSS, JavaScript, C++ source, build configuration, and tests are tracked in this repository. Third-party headers are downloaded with pinned checksums by CMake.
+
+The current executable block catalog remains diffusion-only. Solid-mechanics blocks and their MOOSE/MARLINS mappings must be added before a mechanics assembly can generate a runnable input.
