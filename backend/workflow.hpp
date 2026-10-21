@@ -16,7 +16,7 @@ void workflow_proxy(const std::string& path,const std::string& body,httplib::Res
 }
 void register_workflow(httplib::Server& server) {
  server.Get("/api/models",[](const auto&,auto& r){workflow_proxy("/models","{}",r);});
- for(const std::string action:{"start","status","approve","reject"}) {
+ for(const std::string action:{"start","status","approve","reject","run","cancel_run"}) {
   server.Post("/api/jobs/"+action,[action](const auto& req,auto& r){
    if(req.get_header_value("Content-Type")!="application/json"){r.status=415;return;}
    workflow_proxy("/jobs/"+action,req.body,r);

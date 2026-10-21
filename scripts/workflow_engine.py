@@ -49,6 +49,19 @@ CLAUDE_FALLBACK_MODELS={'claude-opus-5-5','claude-sonnet-5-5','claude-fable-5-1'
 # Claude Code CLI aliases; the CLI signs in with a Claude subscription (Pro/Max/Team/Enterprise).
 CLAUDE_CODE_MODELS=['opus','sonnet','haiku']
 
+def describe(answer):
+ # One-line summary of a structured model answer for the job activity log.
+ if not isinstance(answer,dict):return ''
+ parts=[]
+ if answer.get('status'):parts.append('Plan status: '+str(answer['status'])+'.')
+ objects=answer.get('objects') or []
+ if objects:parts.append('Objects: '+', '.join(map(str,objects[:12]))+(', …' if len(objects)>12 else '')+'.')
+ if answer.get('files'):parts.append('Source files: '+', '.join(str(f.get('path','?')) for f in answer['files'])+'.')
+ if answer.get('tests'):parts.append(str(len(answer['tests']))+' numerical test(s).')
+ if answer.get('questions'):parts.append(str(len(answer['questions']))+' question(s) for you.')
+ if answer.get('summary'):parts.append(str(answer['summary'])[:300])
+ return ' '.join(parts)
+
 def claude_cli(args):
  path=getattr(args,'claude',None) or shutil.which('claude')
  local=Path.home()/'.local/bin/claude'
@@ -203,10 +216,27 @@ class Engine:
    raise RuntimeError('Claude declined this request'+(': '+detail if detail else '.'))
   if message.stop_reason=='max_tokens':raise RuntimeError('Claude response exceeded the output limit before completing the JSON.')
   return json.loads(next(b.text for b in message.content if b.type=='text'))
+ def log(self,j,message):
+  # Kept in memory for live polling and saved with the next state update.
+  with self.lock:
+   entries=j.setdefault('log',[]);entries.append({'t':round(time.time(),1),'message':str(message)[:600]})
+   del entries[:-300]
+ def ask(self,j,purpose,prompt,schema):
+  model=j.get('model') or {}
+  self.log(j,'Asking '+str(model.get('provider','?'))+' / '+str(model.get('id','?'))+' to '+purpose+' ('+str(max(1,len(prompt)//1000))+' kB prompt).')
+  started=time.time()
+  try:answer=self.llm(model,prompt,schema)
+  except Exception as e:
+   self.log(j,'Model call failed after '+str(round(time.time()-started))+' s: '+str(e)[:300]);raise
+  self.log(j,'Model answered in '+str(round(time.time()-started))+' s. '+describe(answer))
+  return answer
  def persist(self,j):
   self.rpc({'op':'save_job','id':j['id'],'state':j})
  def update(self,j,**values):
-  with self.lock:j.update(values);j['updated_at']=time.time()
+  with self.lock:
+   if values.get('summary') and values['summary']!=j.get('summary'):self.log(j,values['summary'])
+   if values.get('error'):self.log(j,'Error: '+str(values['error'])[:400])
+   j.update(values);j['updated_at']=time.time()
   self.persist(j)
  def start(self,request):
   g=request.get('graph');errors=graph_errors(g)
@@ -217,6 +247,7 @@ class Engine:
   jid=uuid.uuid4().hex
   j={'id':jid,'status':'discovering','graph':g,'graph_hash':digest(g),'model':model,'summary':'Inspecting available MOOSE objects.','created_at':time.time()}
   with self.lock:self.jobs[jid]=j
+  self.log(j,'Job created for '+str(model.get('provider'))+' / '+str(model.get('id'))+' with '+str(len(g.get('nodes',[])))+' blocks and '+str(len(g.get('edges',[])))+' connections.')
   self.persist(j);self.launch(j,self.plan)
   return self.public(j)
  def launch(self,j,fn):
@@ -230,19 +261,22 @@ class Engine:
     with self.lock:self.active.discard(j['id'])
   threading.Thread(target=work,daemon=True).start()
  def plan(self,j):
+  self.log(j,'Loading the MOOSE/MARLINS object catalog and retained capabilities from Gilbreth.')
   context=self.rpc({'op':'context','graph':j['graph']})
+  self.log(j,'Catalog loaded: '+str(len(context.get('object_paths',[])))+' registered objects, '+str(len(context.get('capabilities',[])))+' retained VIBORA capabilities.')
   evidence=graph_evidence(j['graph']);j['evidence']=evidence
-  discovery=self.llm(j['model'],INSTRUCTIONS+'\nSelect up to 30 object/action names from this catalog whose parameter definitions are needed. Return questions only for genuinely missing model data.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'catalog':context}),DISCOVERY)
+  discovery=self.ask(j,'choose the MOOSE objects whose parameters it needs',INSTRUCTIONS+'\nSelect up to 30 object/action names from this catalog whose parameter definitions are needed. Return questions only for genuinely missing model data.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'catalog':context}),DISCOVERY)
   details=self.rpc({'op':'details','paths':discovery['objects']})
+  self.log(j,'Loaded parameter documentation and source for '+str(len(details))+' objects: '+', '.join(d['path'].rsplit('/',1)[-1] for d in details[:15])+('…' if len(details)>15 else '')+'.')
   self.update(j,status='planning',summary='Designing the MOOSE input from registered object definitions.')
   prompt=INSTRUCTIONS+'\nReturn a complete MOOSE input if feasible with existing objects. Otherwise return needs_custom with a concrete proposal, or needs_clarification with questions. No C++ files yet.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'objects':details,'retained_capabilities':context['capabilities'],'discovery_questions':discovery['questions']})
-  plan=self.llm(j['model'],prompt,PLAN)
+  plan=self.ask(j,'design the MOOSE input',prompt,PLAN)
   j['context']={'objects':details,'retained_capabilities':context['capabilities']}
   self.finish_plan(j,plan,prompt)
  def review_questions(self,j,plan,prompt):
   if plan['status']!='needs_clarification' and not plan['questions']:return plan
   self.update(j,status='planning',summary='Checking proposed questions against existing graph settings and connections.')
-  return self.llm(j['model'],prompt+"\nReview the provisional plan below before asking the user anything. "
+  return self.ask(j,'check '+str(len(plan['questions']))+' proposed question(s) against the graph',prompt+"\nReview the provisional plan below before asking the user anything. "
    "Answer every proposed question from the graph evidence wherever possible. In particular mesh params "
    "specify dimensions/resolution, variable blocks specify names, edges specify couplings and IC targets. "
    "Use model-level requirements to resolve overrides. Remove already-answered questions; regenerate "
@@ -257,11 +291,14 @@ class Engine:
    self.update(j,status='awaiting_approval',summary=plan['summary'],rationale=plan['rationale'],plan=plan,plan_hash=digest(plan));return
   for attempt in range(3):
    self.update(j,status='checking',summary='Checking the proposed input with the installed MOOSE application.')
+   self.log(j,'Running MOOSE --check-input on Gilbreth (attempt '+str(attempt+1)+' of 3).')
    check=self.rpc({'op':'check','id':j['id'],'input':plan['input']})
+   errors=[l.strip() for l in (check.get('stdout','')+'\n'+check.get('stderr','')).splitlines() if 'error' in l.lower()]
+   self.log(j,'MOOSE input check passed.' if check.get('valid') else 'MOOSE input check failed'+(': '+errors[0][:300] if errors else '.'))
    if check['valid']:
     self.update(j,status='ready',summary=plan['summary'],input=plan['input'],plan=plan,validation=check,verification='MOOSE --check-input passed; no full simulation was run.');return
    if attempt<2:
-    plan=self.llm(j['model'],prompt+'\nThe input failed MOOSE validation. Repair syntax/parameters; do not simplify the physics.\n'+json.dumps({'previous':plan,'diagnostics':check}),PLAN)
+    plan=self.ask(j,'repair the input using the MOOSE diagnostics',prompt+'\nThe input failed MOOSE validation. Repair syntax/parameters; do not simplify the physics.\n'+json.dumps({'previous':plan,'diagnostics':check}),PLAN)
     if plan['status']!='builtin' or plan['questions']:
      plan=self.review_questions(j,plan,prompt)
     if plan['status']!='builtin' or plan['questions']:
@@ -277,6 +314,7 @@ class Engine:
    if j['status'] in ('queued','building','testing'):self.launch(j,self.monitor)
    elif j['status'] in ('discovering','planning','checking','coding'):
     self.update(j,status='failed',error='The agent stopped during this job. Start a new generation request.')
+   if (j.get('run') or {}).get('status') in ('queued','running'):self.launch(j,self.monitor_run)
   return j
  def approve(self,request):
   j=self.get(request['id'])
@@ -305,12 +343,13 @@ each test input must produce scalar postprocessor columns in CSV, and checks spe
 the FINAL-row expected column value and absolute tolerance. Exit status alone is not
 a sufficient test. Tests run serially with a 120-second limit each.
 """ + json.dumps({'graph':j['graph'],'approved_plan':j['plan'],'context':j.get('context',{})})
-  package=self.llm(j['model'],prompt,PACKAGE)
+  package=self.ask(j,'write the custom C++ implementation and numerical tests',prompt,PACKAGE)
   j['package']=package;j['coding_prompt']=prompt;j['repair_count']=0
   self.submit_package(j)
  def submit_package(self,j):
   self.rpc({'op':'stage','id':j['id'],'package':j['package']})
   result=self.rpc({'op':'submit','id':j['id']})
+  self.log(j,'Staged '+str(len(j['package']['files']))+' source file(s); compile-and-test job submitted to Slurm as '+str(result['scheduler_id'])+'.')
   self.update(j,status='queued',summary='Source staged; waiting for the scheduler to compile and test.',scheduler_id=result['scheduler_id'],files=[f['path'] for f in j['package']['files']])
   self.monitor(j)
  def monitor(self,j):
@@ -318,6 +357,8 @@ a sufficient test. Tests run serially with a 120-second limit each.
    state=self.rpc({'op':'build_status','id':j['id']})
    if state['status']=='complete':
     result=state['result']
+    tests=result.get('tests') or []
+    self.log(j,'Slurm job finished at the '+str(result.get('phase','?'))+' phase: '+str(sum(t['passed'] for t in tests))+' of '+str(len(tests))+' numerical test(s) passed.')
     if result.get('passed'):
      self.update(j,status='retaining',summary='Build and numerical tests passed. Retaining the new capability.',test_result=result)
      retained=self.rpc({'op':'promote','id':j['id']},timeout=90)
@@ -326,7 +367,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
      return
     if j.get('repair_count',0)<2:
      self.update(j,status='coding',summary='Build or test failed. Repairing the approved implementation.',test_result=result)
-     j['package']=self.llm(j['model'],j['coding_prompt']+'\nRepair the implementation without weakening tests or changing requested physics.\n'+json.dumps({'previous':j['package'],'failure':result}),PACKAGE)
+     j['package']=self.ask(j,'repair the implementation after the failed build or tests',j['coding_prompt']+'\nRepair the implementation without weakening tests or changing requested physics.\n'+json.dumps({'previous':j['package'],'failure':result}),PACKAGE)
      j['repair_count']=j.get('repair_count',0)+1
      self.rpc({'op':'stage','id':j['id'],'package':j['package']})
      queued=self.rpc({'op':'submit','id':j['id']})
@@ -337,6 +378,47 @@ a sufficient test. Tests run serially with a 120-second limit each.
    newstatus='building' if state['status']=='running' else 'queued'
    if j['status']!=newstatus:self.update(j,status=newstatus,summary='Compiling and running numerical tests.' if newstatus=='building' else 'Waiting for a scheduler allocation.',scheduler=state)
    time.sleep(10)
+ def run(self,request):
+  j=self.get(request['id'])
+  if j.get('status')!='ready' or not j.get('input'):raise ValueError('Only a validated, ready model can be run.')
+  if (j.get('run') or {}).get('status') in ('submitting','queued','running'):raise ValueError('A simulation for this job is already queued or running.')
+  try:ranks=int(request.get('ranks') or 0)
+  except (TypeError,ValueError):raise ValueError('MPI ranks must be a whole number.')
+  if not 0<=ranks<=128:raise ValueError('MPI ranks must be between 1 and 128.')
+  wall=str(request.get('time') or '')
+  if wall and not re.fullmatch(r'\d{1,2}:\d{2}:\d{2}',wall):raise ValueError('Wall time must look like HH:MM:SS.')
+  self.update(j,run={'status':'submitting','requested_at':time.time()})
+  self.log(j,'Submitting the simulation to Slurm.')
+  try:result=self.rpc({'op':'run_submit','id':j['id'],'input':j['input'],'ranks':ranks,'time':wall})
+  except Exception as e:
+   self.update(j,run={'status':'failed','error':str(e)});self.log(j,'Simulation submission failed: '+str(e)[:400]);raise
+  self.update(j,run=dict(result,status='queued'))
+  self.log(j,'Simulation queued as Slurm job '+str(result['scheduler_id'])+' ('+str(result['ranks'])+' MPI ranks, '+str(result['time'])+' wall time).')
+  self.launch(j,self.monitor_run)
+  return self.public(j)
+ def cancel_run(self,request):
+  j=self.get(request['id'])
+  if (j.get('run') or {}).get('status') not in ('queued','running'):raise ValueError('No queued or running simulation to cancel.')
+  self.rpc({'op':'run_cancel','id':j['id']});self.log(j,'Cancellation requested for Slurm job '+str(j['run'].get('scheduler_id'))+'.')
+  return self.public(j)
+ def monitor_run(self,j):
+  # Run failures belong to the run, not the validated job, so they are caught here.
+  try:
+   while True:
+    state=self.rpc({'op':'run_status','id':j['id']})
+    run=dict(j.get('run') or {})
+    if state['status'] in ('complete','failed','cancelled'):
+     run.update(state);self.update(j,run=run)
+     if state['status']=='complete':self.log(j,'Simulation finished on '+str(state.get('node') or 'the compute node')+'. '+str(len(state.get('outputs',[])))+' output file(s) in '+str(state.get('folder'))+'.')
+     elif state['status']=='cancelled':self.log(j,'Simulation cancelled.')
+     else:self.log(j,'Simulation failed: '+str(state.get('error') or 'MOOSE exited with code '+str(state.get('returncode'))))
+     return
+    if state['status']!=run.get('status') or state.get('reason')!=run.get('reason'):
+     run.update(state);self.update(j,run=run)
+     self.log(j,'Simulation running on '+str(state.get('node') or 'a compute node')+'.' if state['status']=='running' else 'Waiting for a compute node ('+str(state.get('reason') or 'pending')+').')
+    time.sleep(10)
+  except Exception as e:
+   self.update(j,run=dict(j.get('run') or {},status='failed',error=str(e)));self.log(j,'Lost track of the simulation: '+str(e)[:400])
  def public(self,j):
   return {k:v for k,v in j.items() if k not in ('context','coding_prompt','package','graph')}
  def request(self,path,data):
@@ -345,6 +427,8 @@ a sufficient test. Tests run serially with a 120-second limit each.
   if path=='/jobs/approve':return self.approve(data)
   if path=='/jobs/reject':return self.reject(data)
   if path=='/jobs/status':return self.public(self.get(data['id']))
+  if path=='/jobs/run':return self.run(data)
+  if path=='/jobs/cancel_run':return self.cancel_run(data)
   if path=='/graph/check':
    errors=graph_errors(data);return {'valid':not errors,'issues':[{'message':e,'severity':'error'} for e in errors]}
   raise ValueError('Unknown workflow endpoint')

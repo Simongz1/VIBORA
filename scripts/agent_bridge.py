@@ -112,7 +112,7 @@ def main():
             self.send_response(code);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(data)))
             self.end_headers();self.wfile.write(data)
         def do_POST(self):
-            if self.path not in ("/resolve","/models","/jobs/start","/jobs/status","/jobs/approve","/jobs/reject","/graph/check"): self.send_error(404);return
+            if self.path not in ("/resolve","/models","/jobs/start","/jobs/status","/jobs/approve","/jobs/reject","/jobs/run","/jobs/cancel_run","/graph/check"): self.send_error(404);return
             if not hmac.compare_digest(self.headers.get("Authorization",""),"Bearer "+token):
                 self.send_error(401);return
             if self.headers.get("Content-Type")!="application/json":

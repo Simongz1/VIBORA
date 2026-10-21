@@ -127,6 +127,65 @@ class ClaudeCodeProviderTests(unittest.TestCase):
    self.assertEqual(listed,engine.CLAUDE_CODE_MODELS if signed_in else [])
    if not signed_in:self.assertIn('claude auth login',result['providers']['claude-code'])
 
+class ActivityLogTests(unittest.TestCase):
+ def test_model_calls_and_steps_are_logged(self):
+  e=FakeEngine();j={'id':'a'*32,'model':{'provider':'local','id':'m'},'summary':''}
+  e.llm=lambda *a:{'status':'builtin','objects':['Kernels/Diffusion'],'questions':[],'summary':'ok'}
+  e.ask(j,'design the MOOSE input','prompt',engine.PLAN)
+  e.update(j,summary='Checking the input.');e.update(j,summary='Checking the input.')
+  messages=[x['message'] for x in j['log']]
+  self.assertIn('local / m to design the MOOSE input',messages[0]);self.assertIn('Kernels/Diffusion',messages[1])
+  self.assertEqual(messages.count('Checking the input.'),1)
+ def test_failed_model_call_is_logged_and_raised(self):
+  e=FakeEngine();j={'id':'a'*32,'model':{'provider':'local','id':'m'}}
+  def fail(*a):raise RuntimeError('usage limit')
+  e.llm=fail
+  with self.assertRaises(RuntimeError):e.ask(j,'plan','p',engine.PLAN)
+  self.assertIn('usage limit',j['log'][-1]['message'])
+ def test_log_is_bounded(self):
+  e=FakeEngine();j={}
+  for i in range(400):e.log(j,str(i))
+  self.assertEqual(len(j['log']),300);self.assertEqual(j['log'][-1]['message'],'399')
+
+class SimulationRunTests(unittest.TestCase):
+ def ready(self,states=()):
+  e=FakeEngine();public=e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'}});j=e.jobs[public['id']]
+  j.update(status='ready',input='[Mesh]\n[]');queue=list(states);rpc=e.rpc;e.calls=[]
+  def fake(payload,timeout=220):
+   e.calls.append(payload)
+   if payload['op']=='run_submit':return {'scheduler_id':'123','ranks':payload['ranks'] or 2,'time':payload['time'] or '00:20:00','folder':'/r/run'}
+   if payload['op']=='run_status':return queue.pop(0)
+   return rpc(payload,timeout)
+  e.rpc=fake;return e,j
+ def test_run_requires_ready_job(self):
+  e,j=self.ready();j['status']='needs_clarification'
+  with self.assertRaises(ValueError):e.run({'id':j['id']})
+  self.assertFalse(any(c['op']=='run_submit' for c in e.calls))
+ def test_invalid_resources_rejected_before_submission(self):
+  for request in ({'ranks':500},{'ranks':'two'},{'time':'1 hour'}):
+   e,j=self.ready()
+   with self.assertRaises(ValueError):e.run(dict(request,id=j['id']))
+   self.assertFalse(any(c['op']=='run_submit' for c in e.calls))
+ def test_submission_sends_validated_input_and_starts_monitor(self):
+  e,j=self.ready();e.run({'id':j['id'],'ranks':4,'time':'01:00:00'})
+  submit=[c for c in e.calls if c['op']=='run_submit'][0]
+  self.assertEqual((submit['input'],submit['ranks'],submit['time']),('[Mesh]\n[]',4,'01:00:00'))
+  self.assertEqual(j['run']['status'],'queued');self.assertIn('monitor_run',e.launched)
+  with self.assertRaises(ValueError):e.run({'id':j['id']})
+ def test_monitor_reports_completion_without_changing_job_status(self):
+  done={'status':'complete','node':'gilbreth-k001','outputs':[{'name':'model_out.csv','size':10}],'folder':'/r/run','postprocessors':{'avg':'1'}}
+  e,j=self.ready([{'status':'running','node':'gilbreth-k001'},done])
+  e.run({'id':j['id']})
+  original=engine.time.sleep;engine.time.sleep=lambda s:None;self.addCleanup(setattr,engine.time,'sleep',original)
+  e.monitor_run(j)
+  self.assertEqual(j['run']['status'],'complete');self.assertEqual(j['status'],'ready')
+  self.assertTrue(any('running on gilbreth-k001' in x['message'] for x in j['log']))
+ def test_lost_scheduler_marks_only_the_run_failed(self):
+  e,j=self.ready();e.run({'id':j['id']})
+  def broken(payload,timeout=220):raise RuntimeError('ssh dropped')
+  e.rpc=broken;e.persist=lambda j:None;e.monitor_run(j)
+  self.assertEqual(j['run']['status'],'failed');self.assertEqual(j['status'],'ready')
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[
@@ -181,6 +240,33 @@ class WorkspaceTests(unittest.TestCase):
   self.jid='a'*32
  def tearDown(self):
   workspace.ROOT,workspace.STATE=self.old;self.tmp.cleanup()
+ def test_run_submit_requires_ready_state_and_exact_input(self):
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'good'})
+  with self.assertRaises(ValueError):workspace.run_submit(self.jid,'tampered',1,'')
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'checking','input':'good'})
+  with self.assertRaises(ValueError):workspace.run_submit(self.jid,'good',1,'')
+ def test_run_submit_builds_slurm_request(self):
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'[Mesh]\n[]'})
+  calls=[];original=workspace.run
+  workspace.run=lambda args,**kw:calls.append(args) or {'returncode':0,'stdout':'4242\n','stderr':''}
+  self.addCleanup(setattr,workspace,'run',original)
+  result=workspace.run_submit(self.jid,'[Mesh]\n[]',3,'00:45:00')
+  args=calls[0];self.assertEqual(args[0],'sbatch')
+  self.assertEqual(args[args.index('--ntasks')+1],'3');self.assertEqual(args[args.index('--time')+1],'00:45:00')
+  folder=workspace.jobdir(self.jid)/'run'
+  self.assertEqual(result['scheduler_id'],'4242');self.assertEqual((folder/'model.i').read_text(),'[Mesh]\n[]')
+  self.assertIn('mpiexec -n 3',(folder/'run.sbatch').read_text())
+ def test_finished_run_reports_final_csv_values(self):
+  folder=workspace.jobdir(self.jid)/'run';folder.mkdir()
+  workspace.save(folder/'scheduler.json',{'id':'7'});(folder/'exit_code').write_text('0\n');(folder/'node').write_text('gilbreth-k001\n')
+  (folder/'model_out.csv').write_text('time,avg\n0,0\n1,2.5\n');(folder/'moose.log').write_text('Solve Converged!')
+  status=workspace.run_status(self.jid)
+  self.assertEqual(status['status'],'complete');self.assertEqual(status['postprocessors'],{'time':'1','avg':'2.5'})
+  self.assertEqual(status['node'],'gilbreth-k001');self.assertEqual([f['name'] for f in status['outputs']],['model_out.csv','moose.log'])
+ def test_cancelled_run_is_not_reported_as_failure(self):
+  folder=workspace.jobdir(self.jid)/'run';folder.mkdir()
+  workspace.save(folder/'scheduler.json',{'id':'7','cancelled':True});(folder/'exit_code').write_text('143')
+  self.assertEqual(workspace.run_status(self.jid)['status'],'cancelled')
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())

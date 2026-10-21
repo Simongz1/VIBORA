@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH JSON RPC for catalog discovery, isolated MOOSE builds and persistent capabilities."""
-import csv, fcntl, hashlib, json, math, os, re, shutil, subprocess, sys, time
+import csv, fcntl, hashlib, json, math, os, re, shlex, shutil, subprocess, sys, time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 STATE=ROOT/'.vibora'
@@ -171,6 +171,67 @@ def build_status(jid):
  if state:return {'status':'running' if state.startswith('RUNNING') else 'queued','scheduler':state,'scheduler_id':sid}
  log=(folder/'scheduler.log').read_text()[-8000:] if (folder/'scheduler.log').exists() else ''
  return {'status':'failed','error':'Scheduler job ended without a build result.','log':log,'scheduler_id':sid}
+RUN_FILES={'model.i','run.sbatch','scheduler.json','exit_code','node','slurm.log'}
+def run_results(folder):
+ result={'folder':str(folder),'outputs':[],'postprocessors':{}}
+ if (folder/'node').exists():result['node']=(folder/'node').read_text().strip()
+ if (folder/'moose.log').exists():result['log_tail']=(folder/'moose.log').read_text(errors='replace')[-6000:]
+ for f in sorted(folder.iterdir()):
+  if f.is_file() and f.name not in RUN_FILES:result['outputs'].append({'name':f.name,'size':f.stat().st_size})
+ # Final-row postprocessor values from the main CSV output.
+ csvs=sorted(folder.glob('*.csv'),key=lambda f:(not f.name.endswith('_out.csv'),f.name))
+ if csvs:
+  with csvs[0].open() as f:rows=list(csv.DictReader(f))
+  if rows:result['postprocessors']=rows[-1];result['csv']=csvs[0].name;result['csv_rows']=len(rows)
+ return result
+def run_submit(jid,text,ranks,wall):
+ state=json.loads((jobdir(jid)/'state.json').read_text())
+ # Only the exact input of a validated job may be run.
+ if state.get('status')!='ready' or state.get('input')!=text:raise ValueError('Only the validated input of a ready job can be run')
+ folder=jobdir(jid)/'run'
+ if (folder/'scheduler.json').exists() and run_status(jid)['status'] in ('queued','running'):raise ValueError('A simulation for this job is already queued or running')
+ if folder.exists():shutil.rmtree(folder)
+ folder.mkdir()
+ cfg=CONFIG['scheduler'];ranks=int(ranks) or int(cfg.get('run_ranks',cfg['cpus']));wall=wall or cfg.get('run_time',cfg['time'])
+ (folder/'model.i').write_text(text)
+ toolchain=os.pathsep.join(CONFIG.get('toolchain_bin',[]))
+ script=folder/'run.sbatch'
+ script.write_text('#!/bin/bash\nset -uo pipefail\ncd '+shlex.quote(str(folder))+'\n'
+  +('export PATH='+shlex.quote(toolchain)+':"$PATH"\n' if toolchain else '')
+  +'export OMP_NUM_THREADS=1\nhostname > node\n'
+  +'mpiexec -n '+str(ranks)+' '+shlex.quote(str(executable()))+' -i model.i Outputs/csv=true > moose.log 2>&1\n'
+  +'echo $? > exit_code\n')
+ args=['sbatch','--parsable','--job-name','vibora-run-'+jid[:8],'--account',cfg['account'],'--partition',cfg['partition'],'--qos',cfg['qos'],
+       '--gres','gpu:'+str(cfg.get('gpus',1)),'--time',wall,'--ntasks',str(ranks),'--cpus-per-task','1','--mem',cfg['memory'],
+       '--output',str(folder/'slurm.log'),str(script)]
+ r=run(args,timeout=30)
+ if r['returncode']!=0:raise RuntimeError(r['stderr'] or r['stdout'])
+ sid=r['stdout'].strip().split(';')[0]
+ if not sid.isdigit():raise RuntimeError('Invalid scheduler response')
+ save(folder/'scheduler.json',{'id':sid,'ranks':ranks,'time':wall,'submitted_at':time.time()})
+ return {'scheduler_id':sid,'ranks':ranks,'time':wall,'partition':cfg['partition'],'folder':str(folder)}
+def run_status(jid):
+ folder=jobdir(jid)/'run'
+ if not (folder/'scheduler.json').exists():return {'status':'not_submitted'}
+ meta=json.loads((folder/'scheduler.json').read_text());sid=meta['id']
+ if (folder/'exit_code').exists():
+  code=int((folder/'exit_code').read_text().strip() or 1)
+  if code and meta.get('cancelled'):return dict(run_results(folder),status='cancelled',returncode=code,scheduler_id=sid)
+  return dict(run_results(folder),status='complete' if code==0 else 'failed',returncode=code,scheduler_id=sid)
+ r=run(['squeue','-h','-j',sid,'-o','%T|%R|%N'],timeout=20)
+ line=r['stdout'].strip()
+ if line:
+  st,reason,node=(line.split('|')+['',''])[:3]
+  return {'status':'running' if st=='RUNNING' else 'queued','scheduler':st,'reason':reason,'node':node,'scheduler_id':sid}
+ result=dict(run_results(folder),scheduler_id=sid)
+ if meta.get('cancelled'):return dict(result,status='cancelled')
+ log=(folder/'slurm.log').read_text(errors='replace')[-4000:] if (folder/'slurm.log').exists() else ''
+ return dict(result,status='failed',error='Slurm job ended before MOOSE finished (time limit, memory or node failure).',scheduler_log=log)
+def run_cancel(jid):
+ folder=jobdir(jid)/'run';meta=json.loads((folder/'scheduler.json').read_text())
+ r=run(['scancel',meta['id']],timeout=20)
+ if r['returncode']!=0:raise RuntimeError(r['stderr'] or 'scancel failed')
+ meta['cancelled']=True;save(folder/'scheduler.json',meta);return {'cancelling':True}
 def promote(jid):
  folder=jobdir(jid);result=json.loads((folder/'build_result.json').read_text())
  if not result.get('passed'):raise ValueError('Cannot retain an unverified implementation')
@@ -204,6 +265,9 @@ def dispatch(r):
  if op=='submit':return submit(jid)
  if op=='build_status':return build_status(jid)
  if op=='promote':return promote(jid)
+ if op=='run_submit':return run_submit(jid,r['input'],r.get('ranks',0),r.get('time',''))
+ if op=='run_status':return run_status(jid)
+ if op=='run_cancel':return run_cancel(jid)
  raise ValueError('Unknown operation')
 if __name__=='__main__':
  if len(sys.argv)==3 and sys.argv[1]=='--build':

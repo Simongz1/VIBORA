@@ -31,6 +31,40 @@ $('#new-model').onclick=()=>{
  graph={version:2,title:'New MOOSE model',request:'',nodes:[node('component',100,100,'Model physics')],edges:[]};
  selected=graph.nodes[0].id;pending=null;render();inspect();invalidate();
 };
+const RUN_ACTIVE=['submitting','queued','running'];
+function renderLog(entries,active){
+ const list=$('#job-log'),follow=list.scrollTop+list.clientHeight>=list.scrollHeight-8;
+ list.replaceChildren(...entries.map(e=>{const li=el('li',e.message);li.dataset.time=new Date(e.t*1000).toLocaleTimeString();return li;}));
+ const last=entries[entries.length-1];
+ if(active&&last){const waited=Math.round(Date.now()/1000-last.t);if(waited>=5)list.append(el('li','Still working — '+waited+' s since the last step.','waiting'));}
+ if(follow)list.scrollTop=list.scrollHeight;
+}
+function runText(run){
+ if(!run.status)return '';
+ const id=run.scheduler_id?' (Slurm job '+run.scheduler_id+')':'';
+ if(run.status==='submitting')return 'Submitting to Slurm…';
+ if(run.status==='queued')return 'Waiting for a compute node'+id+(run.reason?': '+run.reason:'')+'.';
+ if(run.status==='running')return 'Running on '+(run.node||'a compute node')+id+'.';
+ if(run.status==='complete')return 'Finished on '+(run.node||'the compute node')+id+'.';
+ if(run.status==='cancelled')return 'Cancelled'+id+'.';
+ return 'Failed'+id+': '+(run.error||'MOOSE exited with code '+run.returncode)+'.';
+}
+function showRun(job){
+ const run=job.run||{},active=RUN_ACTIVE.includes(run.status);
+ $('#run-panel').hidden=job.status!=='ready';
+ $('#start-run').disabled=active;$('#start-run').textContent=run.status&&!active?'Run again':'Run on compute node';
+ $('#cancel-run').hidden=!['queued','running'].includes(run.status);
+ $('#run-status').textContent=runText(run);
+ const details={};
+ if(run.folder)details.results_folder_on_gilbreth=run.folder;
+ if(run.postprocessors&&Object.keys(run.postprocessors).length)details['final_values ('+run.csv+', '+run.csv_rows+' rows)']=run.postprocessors;
+ if(run.outputs?.length)details.output_files=run.outputs.map(f=>f.name+' ('+Math.max(1,Math.round(f.size/1024))+' kB)');
+ if(run.scheduler_log)details.scheduler_log=run.scheduler_log;
+ let text=Object.keys(details).length?JSON.stringify(details,null,2):'';
+ if(run.log_tail&&!active)text+=(text?'\n\n':'')+'MOOSE log (end):\n'+run.log_tail;
+ $('#run-details').hidden=!text;$('#run-details').textContent=text;
+ return active;
+}
 function showJob(job){
  currentJob=job;$('#job-status').hidden=false;
  $('#job-title').textContent=job.status.replaceAll('_',' ');
@@ -51,10 +85,11 @@ function showJob(job){
  if(job.test_result)details.build_and_tests=job.test_result;
  if(job.retained)details.retained_capability=job.retained;
  if(job.error)details.error=job.error;
- $('#job-details').textContent=Object.keys(details).length?JSON.stringify(details,null,2):'';
+ $('#job-details').textContent=Object.keys(details).length?JSON.stringify(details,null,2):'';$('#job-details').hidden=!Object.keys(details).length;
  const terminal=['ready','failed','needs_clarification','awaiting_approval','cancelled'].includes(job.status);
- setBusy(!terminal);status(job.status+': '+(job.summary||job.error||''));
- if(terminal)clearTimeout(pollTimer);else pollTimer=setTimeout(pollJob,2000);
+ const running=showRun(job);renderLog(job.log||[],!terminal||running);
+ setBusy(!terminal);status(running?'Simulation: '+runText(job.run):job.status+': '+(job.summary||job.error||''));
+ clearTimeout(pollTimer);if(!terminal||running)pollTimer=setTimeout(pollJob,2000);
 }
 async function pollJob(){
  if(!currentJob)return;
@@ -66,6 +101,7 @@ $('#generate').onclick=async()=>{
  clearTimeout(timer);generated='';resolvedGraph=null;setBusy(true);jobSnapshot=JSON.stringify(graph);
  $('#job-dialog').showModal();$('#job-title').textContent='Starting';$('#job-summary').textContent='Creating a MOOSE implementation job…';
  $('#job-questions').replaceChildren();$('#job-details').textContent='';$('#custom-approval').hidden=true;$('#view-generated').hidden=true;
+ $('#job-log').replaceChildren();$('#run-panel').hidden=true;
  try{
   const job=await api('jobs/start',{graph:clone(graph),model:selectedModel});
   localStorage.setItem('vibora-job',JSON.stringify({id:job.id,snapshot:jobSnapshot}));showJob(job);
@@ -79,6 +115,16 @@ $('#approve-custom').onclick=async()=>{
  catch(e){$('#job-summary').textContent=e.message;$('#approve-custom').disabled=false;}
 };
 $('#decline-custom').onclick=async()=>{try{showJob(await api('jobs/reject',{id:currentJob.id}));}catch(e){status(e.message);}};
+$('#start-run').onclick=async()=>{
+ if(!currentJob||currentJob.status!=='ready')return;
+ $('#start-run').disabled=true;$('#run-status').textContent='Submitting to Slurm…';
+ try{showJob(await api('jobs/run',{id:currentJob.id,ranks:Number($('#run-ranks').value)||0,time:$('#run-time').value.trim()}));}
+ catch(e){$('#run-status').textContent=e.message;$('#start-run').disabled=false;}
+};
+$('#cancel-run').onclick=async()=>{
+ if(!currentJob||!confirm('Cancel this Slurm job? Partial output stays in the run folder.'))return;
+ try{showJob(await api('jobs/cancel_run',{id:currentJob.id}));}catch(e){$('#run-status').textContent=e.message;}
+};
 $('#close-job').onclick=()=>$('#job-dialog').close();
 $('#job-status').onclick=()=>{$('#job-dialog').showModal();pollJob();};
 $('#view-generated').onclick=()=>{

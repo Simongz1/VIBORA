@@ -34,6 +34,11 @@ When a request requires custom code, the job presents the reason and asks for ex
 
 `config.example.json` defines installed paths and scheduler/toolchain defaults; override locally in ignored `config.local.json`. The custom application extends the installed MARLINS application and registers `ViboraPhysicsApp` objects. Jobs/logs/caches live in ignored `.vibora/`. Compute builds and solves run in scheduler allocations. Runtime custom sources currently support kernels, materials, BCs, AuxKernels, functions, user objects, postprocessors and ICs; the GUI can describe other installed object categories as well.
 
+## Agent activity and simulation runs
+The job dialog's **Agent activity** log shows each step as it happens: catalog loading, every model call (purpose, prompt size, duration and a summary of the answer), MOOSE input checks with the first error line, Slurm submissions, build/test results and repairs. A note appears when a step has been running for a while. Entries are kept in memory and saved with the job state.
+
+When a job is ready, **Run on compute node** submits the validated input (only that exact input) to Slurm with the account, partition, QoS, GPU and memory settings from `scheduler`. MPI ranks and wall time default to `run_ranks` and `run_time`; override them per run in the dialog. MOOSE runs with `Outputs/csv=true` in `.vibora/jobs/<id>/run/` on Gilbreth. The dialog shows queue/run state, the compute node, final CSV postprocessor values, output files and the end of the MOOSE log. Queued or running simulations can be cancelled, and monitoring resumes if the bridge restarts. A finished run only means MOOSE exited cleanly; check convergence and results yourself.
+
 ## Architecture and verification
 - `web/`: buildless GUI, editor, model picker and asynchronous job/approval views.
 - `backend/`: C++ HTTP server, catalog and workflow proxy. Bounded worker pool and request limits.

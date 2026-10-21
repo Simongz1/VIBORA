@@ -8,7 +8,9 @@
     "time": "00:20:00",
     "cpus": 2,
     "memory": "8G",
-    "gpus": 1
+    "gpus": 1,
+    "run_ranks": 2,
+    "run_time": "00:30:00"
   },
   "max_repairs": 2,
   "ollama_url": "http://127.0.0.1:11434",
