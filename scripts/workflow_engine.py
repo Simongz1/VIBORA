@@ -384,22 +384,30 @@ a sufficient test. Tests run serially with a 120-second limit each.
   if (j.get('run') or {}).get('status') in ('submitting','queued','running'):raise ValueError('A simulation for this job is already queued or running.')
   try:ranks=int(request.get('ranks') or 0)
   except (TypeError,ValueError):raise ValueError('MPI ranks must be a whole number.')
-  if not 0<=ranks<=128:raise ValueError('MPI ranks must be between 1 and 128.')
+  where=request.get('where') or 'slurm'
+  if where not in ('slurm','login'):raise ValueError('Run location must be a compute node or the login node.')
+  if not 0<=ranks<=(4 if where=='login' else 128):raise ValueError('Login-node runs are limited to 4 MPI ranks.' if where=='login' else 'MPI ranks must be between 1 and 128.')
   wall=str(request.get('time') or '')
   if wall and not re.fullmatch(r'\d{1,2}:\d{2}:\d{2}',wall):raise ValueError('Wall time must look like HH:MM:SS.')
-  self.update(j,run={'status':'submitting','requested_at':time.time()})
-  self.log(j,'Submitting the simulation to Slurm.')
-  try:result=self.rpc({'op':'run_submit','id':j['id'],'input':j['input'],'ranks':ranks,'time':wall})
+  if where=='login' and wall and sum(int(x)*f for x,f in zip(wall.split(':'),(3600,60,1)))>3600:raise ValueError('Login-node runs are limited to 01:00:00 wall time.')
+  self.update(j,run={'status':'submitting','mode':where,'requested_at':time.time()})
+  self.log(j,'Starting the simulation on the login node.' if where=='login' else 'Submitting the simulation to Slurm.')
+  try:result=self.rpc({'op':'run_submit','id':j['id'],'input':j['input'],'ranks':ranks,'time':wall,'where':where})
   except Exception as e:
    self.update(j,run={'status':'failed','error':str(e)});self.log(j,'Simulation submission failed: '+str(e)[:400]);raise
-  self.update(j,run=dict(result,status='queued'))
-  self.log(j,'Simulation queued as Slurm job '+str(result['scheduler_id'])+' ('+str(result['ranks'])+' MPI ranks, '+str(result['time'])+' wall time).')
+  if result.get('mode')=='login':
+   self.update(j,run=dict(result,status='running'))
+   self.log(j,'Simulation started on login node '+str(result.get('node'))+' ('+str(result['ranks'])+' MPI ranks, '+str(result['time'])+' limit).')
+  else:
+   self.update(j,run=dict(result,status='queued'))
+   self.log(j,'Simulation queued as Slurm job '+str(result['scheduler_id'])+' ('+str(result['ranks'])+' MPI ranks, '+str(result['time'])+' wall time).')
   self.launch(j,self.monitor_run)
   return self.public(j)
  def cancel_run(self,request):
   j=self.get(request['id'])
   if (j.get('run') or {}).get('status') not in ('queued','running'):raise ValueError('No queued or running simulation to cancel.')
-  self.rpc({'op':'run_cancel','id':j['id']});self.log(j,'Cancellation requested for Slurm job '+str(j['run'].get('scheduler_id'))+'.')
+  self.rpc({'op':'run_cancel','id':j['id']})
+  self.log(j,'Cancellation requested for the login-node run.' if j['run'].get('mode')=='login' else 'Cancellation requested for Slurm job '+str(j['run'].get('scheduler_id'))+'.')
   return self.public(j)
  def monitor_run(self,j):
   # Run failures belong to the run, not the validated job, so they are caught here.
@@ -415,7 +423,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
      return
     if state['status']!=run.get('status') or state.get('reason')!=run.get('reason'):
      run.update(state);self.update(j,run=run)
-     self.log(j,'Simulation running on '+str(state.get('node') or 'a compute node')+'.' if state['status']=='running' else 'Waiting for a compute node ('+str(state.get('reason') or 'pending')+').')
+     self.log(j,'Simulation running on '+('login node ' if state.get('mode')=='login' else '')+str(state.get('node') or 'a compute node')+'.' if state['status']=='running' else 'Waiting for a compute node ('+str(state.get('reason') or 'pending')+').')
     time.sleep(10)
   except Exception as e:
    self.update(j,run=dict(j.get('run') or {},status='failed',error=str(e)));self.log(j,'Lost track of the simulation: '+str(e)[:400])

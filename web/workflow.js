@@ -44,15 +44,16 @@ function runText(run){
  const id=run.scheduler_id?' (Slurm job '+run.scheduler_id+')':'';
  if(run.status==='submitting')return 'Submitting to Slurm…';
  if(run.status==='queued')return 'Waiting for a compute node'+id+(run.reason?': '+run.reason:'')+'.';
- if(run.status==='running')return 'Running on '+(run.node||'a compute node')+id+'.';
- if(run.status==='complete')return 'Finished on '+(run.node||'the compute node')+id+'.';
+ const where=run.mode==='login'?'login node ':'';
+ if(run.status==='running')return 'Running on '+where+(run.node||'a compute node')+id+'.';
+ if(run.status==='complete')return 'Finished on '+where+(run.node||'the compute node')+id+'.';
  if(run.status==='cancelled')return 'Cancelled'+id+'.';
  return 'Failed'+id+': '+(run.error||'MOOSE exited with code '+run.returncode)+'.';
 }
 function showRun(job){
  const run=job.run||{},active=RUN_ACTIVE.includes(run.status);
  $('#run-panel').hidden=job.status!=='ready';
- $('#start-run').disabled=active;$('#start-run').textContent=run.status&&!active?'Run again':'Run on compute node';
+ $('#start-run').disabled=active;$('#run-where').disabled=active;updateRunWhere(run.status&&!active);
  $('#cancel-run').hidden=!['queued','running'].includes(run.status);
  $('#run-status').textContent=runText(run);
  const details={};
@@ -115,14 +116,23 @@ $('#approve-custom').onclick=async()=>{
  catch(e){$('#job-summary').textContent=e.message;$('#approve-custom').disabled=false;}
 };
 $('#decline-custom').onclick=async()=>{try{showJob(await api('jobs/reject',{id:currentJob.id}));}catch(e){status(e.message);}};
+function updateRunWhere(again){
+ const login=$('#run-where').value==='login';
+ $('#run-ranks').max=login?4:128;$('#run-ranks').placeholder=login?'1 (max 4)':'Default';$('#run-time').placeholder=login?'00:10:00 (max 01:00:00)':'HH:MM:SS';
+ if(again!==undefined)$('#start-run').dataset.again=again?'1':'';
+ $('#start-run').textContent=($('#start-run').dataset.again?'Run again on ':'Run on ')+(login?'login node':'compute node');
+}
+$('#run-where').onchange=()=>updateRunWhere();
 $('#start-run').onclick=async()=>{
  if(!currentJob||currentJob.status!=='ready')return;
- $('#start-run').disabled=true;$('#run-status').textContent='Submitting to Slurm…';
- try{showJob(await api('jobs/run',{id:currentJob.id,ranks:Number($('#run-ranks').value)||0,time:$('#run-time').value.trim()}));}
+ const where=$('#run-where').value,ranks=Number($('#run-ranks').value)||0;
+ if(where==='login'&&ranks>4){$('#run-status').textContent='Login-node runs are limited to 4 MPI ranks.';return;}
+ $('#start-run').disabled=true;$('#run-status').textContent=where==='login'?'Starting on the login node…':'Submitting to Slurm…';
+ try{showJob(await api('jobs/run',{id:currentJob.id,where,ranks,time:$('#run-time').value.trim()}));}
  catch(e){$('#run-status').textContent=e.message;$('#start-run').disabled=false;}
 };
 $('#cancel-run').onclick=async()=>{
- if(!currentJob||!confirm('Cancel this Slurm job? Partial output stays in the run folder.'))return;
+ if(!currentJob||!confirm('Cancel this simulation? Partial output stays in the run folder.'))return;
  try{showJob(await api('jobs/cancel_run',{id:currentJob.id}));}catch(e){$('#run-status').textContent=e.message;}
 };
 $('#close-job').onclick=()=>$('#job-dialog').close();

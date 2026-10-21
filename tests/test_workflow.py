@@ -1,4 +1,4 @@
-import copy,importlib.util,json,tempfile,types,unittest
+import copy,importlib.util,json,tempfile,time,types,unittest
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def load(name,path):
@@ -172,6 +172,17 @@ class SimulationRunTests(unittest.TestCase):
   self.assertEqual((submit['input'],submit['ranks'],submit['time']),('[Mesh]\n[]',4,'01:00:00'))
   self.assertEqual(j['run']['status'],'queued');self.assertIn('monitor_run',e.launched)
   with self.assertRaises(ValueError):e.run({'id':j['id']})
+
+ def test_login_runs_capped_at_four_ranks_and_one_hour(self):
+  for request in ({'ranks':5},{'time':'01:30:00'},{'where':'gpu-cluster'}):
+   e,j=self.ready()
+   with self.assertRaises(ValueError):e.run(dict({'where':'login'},**request,id=j['id']))
+   self.assertFalse(any(c['op']=='run_submit' for c in e.calls))
+ def test_login_run_starts_running_immediately(self):
+  e,j=self.ready();rpc=e.rpc
+  e.rpc=lambda p,timeout=220:{'mode':'login','scheduler_id':None,'node':'login03','ranks':4,'time':'00:10:00','folder':'/r/run'} if p['op']=='run_submit' else rpc(p,timeout)
+  e.run({'id':j['id'],'where':'login','ranks':4})
+  self.assertEqual(j['run']['status'],'running');self.assertIn('login node login03',j['log'][-1]['message'])
  def test_monitor_reports_completion_without_changing_job_status(self):
   done={'status':'complete','node':'gilbreth-k001','outputs':[{'name':'model_out.csv','size':10}],'folder':'/r/run','postprocessors':{'avg':'1'}}
   e,j=self.ready([{'status':'running','node':'gilbreth-k001'},done])
@@ -267,6 +278,44 @@ class WorkspaceTests(unittest.TestCase):
   folder=workspace.jobdir(self.jid)/'run';folder.mkdir()
   workspace.save(folder/'scheduler.json',{'id':'7','cancelled':True});(folder/'exit_code').write_text('143')
   self.assertEqual(workspace.run_status(self.jid)['status'],'cancelled')
+
+ def login_tools(self,moose_body):
+  # Stand-ins for GNU timeout, mpiexec and the MOOSE executable on the login node.
+  bin=workspace.ROOT/'bin';bin.mkdir()
+  for name,body in (('timeout','shift 2\nexec "$@"'),('mpiexec',moose_body)):
+   (bin/name).write_text('#!/bin/bash\n'+body+'\n');(bin/name).chmod(0o755)
+  old=(dict(workspace.CONFIG),workspace.BASE)
+  workspace.CONFIG['toolchain_bin']=[str(bin)];workspace.BASE=bin/'moose-opt'
+  self.addCleanup(lambda:(workspace.CONFIG.clear(),workspace.CONFIG.update(old[0]),setattr(workspace,'BASE',old[1])))
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'[Mesh]\n[]'})
+ def wait_for(self,statuses,limit=20):
+  for _ in range(limit*5):
+   status=workspace.run_status(self.jid)
+   if status['status'] in statuses:return status
+   time.sleep(.2)
+  self.fail('Run never reached '+str(statuses)+': '+str(status))
+ def test_login_run_completes_without_slurm(self):
+  self.login_tools('printf "time,avg\\n1,4.5\\n" > model_out.csv; echo "ranks=$2"')
+  result=workspace.run_submit(self.jid,'[Mesh]\n[]',3,'','login')
+  self.assertEqual((result['mode'],result['ranks'],result['time']),('login',3,'00:10:00'))
+  status=self.wait_for(('complete','failed'))
+  self.assertEqual(status['status'],'complete');self.assertEqual(status['postprocessors'],{'time':'1','avg':'4.5'})
+  self.assertIn('ranks=3',status['log_tail'])
+ def test_login_run_cancelled_through_shared_flag(self):
+  self.login_tools('sleep 60')
+  workspace.run_submit(self.jid,'[Mesh]\n[]',1,'','login')
+  self.assertEqual(self.wait_for(('running',))['mode'],'login')
+  workspace.run_cancel(self.jid)
+  self.assertEqual(self.wait_for(('cancelled','failed','complete'))['status'],'cancelled')
+ def test_login_run_limits(self):
+  self.login_tools('true')
+  for ranks,wall in ((5,''),(2,'02:00:00')):
+   with self.assertRaises(ValueError):workspace.run_submit(self.jid,'[Mesh]\n[]',ranks,wall,'login')
+ def test_login_run_without_heartbeat_reports_failure(self):
+  folder=workspace.jobdir(self.jid)/'run';folder.mkdir()
+  workspace.save(folder/'scheduler.json',{'mode':'login','node':'login03','time':'00:10:00','submitted_at':time.time()-600})
+  status=workspace.run_status(self.jid)
+  self.assertEqual(status['status'],'failed');self.assertIn('stopped without finishing',status['error'])
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())
