@@ -67,6 +67,8 @@ class InferenceTests(unittest.TestCase):
  def test_structured_dimension_and_shared_ic_are_exposed_without_mutation(self):
   g=self.setup_graph();original=copy.deepcopy(g);e=engine.graph_evidence(g)
   self.assertEqual(e['blocks'][0]['specified_parameters'],{'dim':2,'nx':20,'ny':20})
+  self.assertEqual(e['blocks'][0]['template_defaults']['xmax'],1)
+  self.assertEqual(e['blocks'][1]['template_defaults']['family'],'LAGRANGE')
   self.assertEqual(e['blocks'][1]['incoming'][0]['source_parameters']['dim'],2)
   self.assertEqual(e['blocks'][1]['incoming'][1]['source_id'],'ic')
   self.assertEqual(e['blocks'][2]['incoming'][0]['source_id'],'ic')

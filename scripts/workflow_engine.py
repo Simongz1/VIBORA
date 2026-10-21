@@ -26,7 +26,10 @@ block descriptions override stored default parameters. Report overrides in the s
 Infer variable bindings, material property names and IC targets from connected ports. Multiple
 connections to one port can represent a vector, not ambiguity. Shared ICs apply to each target.
 Resolve obvious object-name typos against the supplied registered catalog and report corrections.
-Use documented MOOSE defaults for omitted optional numerical settings and report assumptions.
+Use documented MOOSE defaults and template_defaults for omitted optional settings and report assumptions.
+Template defaults are below explicit parameters in precedence. For legacy GeneratedMesh blocks,
+the default domain is [0,1] on each active axis; do not ask for extents unless explicitly contradicted.
+Do not assign physical length units to this domain without evidence.
 Do not infer physical constants, units, constitutive laws, or initial temperatures from labels.
 Before asking, search the entire graph and requirements; ask only the smallest unresolved
 question and identify the affected block. Do not repeat a discovery-stage question as a fact.
@@ -63,6 +66,10 @@ def graph_evidence(g):
   facts.append({'id':n['id'],'label':n.get('label',n['id']),
    'kind':n.get('kind'),'category':n.get('category'),'object_type':n.get('object_type'),
    'specified_parameters':n.get('params',{}),
+   'template_defaults':({'type':'GeneratedMesh','xmin':0,'xmax':1,'ymin':0,'ymax':1,'zmin':0,'zmax':1}
+     if n.get('kind')=='mesh' and not n.get('object_type') and n.get('params',{}).get('type','GeneratedMesh')=='GeneratedMesh'
+     else {'family':'LAGRANGE','order':'FIRST'} if n.get('kind')=='variable'
+     else {'exodus':True} if n.get('kind')=='output' else {}),
    'descriptions':{k:n.get(k,'') for k in ('physics','method','implementation')},
    'incoming':[{'source':nodes[e['from']].get('label',e['from']),
                 'source_id':e['from'],'source_parameters':nodes[e['from']].get('params',{}),
