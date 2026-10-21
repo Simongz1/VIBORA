@@ -150,4 +150,25 @@ class BackendTests(unittest.TestCase):
         with urllib.request.urlopen(self.url('/')) as r:self.assertIn(b'VIBORA',r.read())
         with urllib.request.urlopen(self.url('/api/catalog')) as r:self.assertEqual(len(json.load(r)),7)
 
+class ServerLifecycleTests(unittest.TestCase):
+    def free_port(self):
+        with socket.socket() as s:
+            s.bind(('127.0.0.1',0)); return s.getsockname()[1]
+    def wait_up(self,port):
+        for _ in range(50):
+            try: urllib.request.urlopen('http://127.0.0.1:%d/api/catalog'%port,timeout=1).close(); return
+            except OSError: time.sleep(.1)
+        self.fail('Server failed to start')
+    def test_second_server_cannot_share_port(self):
+        port=self.free_port();first=subprocess.Popen([BINARY,str(port),WEB],stdout=subprocess.DEVNULL)
+        self.addCleanup(first.wait);self.addCleanup(first.terminate);self.wait_up(port)
+        second=subprocess.run([BINARY,str(port),WEB],capture_output=True,text=True,timeout=10)
+        self.assertNotEqual(second.returncode,0);self.assertIn('Cannot bind port',second.stderr)
+    def test_server_stops_when_bridge_session_ends(self):
+        port=self.free_port()
+        server=subprocess.Popen([BINARY,str(port),WEB],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                                env=dict(os.environ,VIBORA_EXIT_ON_EOF='1'))
+        self.addCleanup(lambda: server.poll() is None and server.kill());self.wait_up(port)
+        server.stdin.close();self.assertEqual(server.wait(timeout=10),0)
+
 if __name__=='__main__': unittest.main()

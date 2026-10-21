@@ -201,6 +201,11 @@ int main(int argc,char**argv) {
  if(argc>1) port=std::stoi(argv[1]);
  if(argc>2) root=argv[2];
  httplib::Server server;
+ // httplib's default SO_REUSEPORT lets a stale server silently share the port and answer
+ // with another session's token; plain SO_REUSEADDR makes a second server fail to bind.
+ server.set_socket_options([](socket_t sock){int yes=1;setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,reinterpret_cast<const void*>(&yes),sizeof(yes));});
+ // Under the laptop bridge, stdin stays open for the SSH session; EOF means the bridge is gone.
+ if(std::getenv("VIBORA_EXIT_ON_EOF"))std::thread([]{std::string line;while(std::getline(std::cin,line)){}std::cerr<<"Bridge disconnected; stopping.\n";std::_Exit(0);}).detach();
  register_workflow(server);
  server.new_task_queue=[] { return new httplib::ThreadPool(4); };
  server.set_payload_max_length(1024*1024);

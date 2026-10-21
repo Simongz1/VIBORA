@@ -147,12 +147,15 @@ def main():
     tunnel=None
     try:
         if args.ssh_host:
-            remote=("cd "+shlex.quote(args.remote_dir)+" && IFS= read -r VIBORA_AGENT_TOKEN && export VIBORA_AGENT_TOKEN && "
-                    "export VIBORA_AGENT_PORT="+str(args.port)+" && exec ./build/vibora "+str(args.gui_port)+" web")
-            tunnel=subprocess.Popen(["ssh","-o","ExitOnForwardFailure=yes",
+            # Stop this user's stale GUI servers for the port on this login node; each holds an old token.
+            # The server exits when this SSH session ends, because the bridge keeps its stdin open.
+            remote=("cd "+shlex.quote(args.remote_dir)+" && { pkill -u \"$(id -u)\" -f '^\\./build/vibora "+str(args.gui_port)+" web$' && sleep 1; }; "
+                    "IFS= read -r VIBORA_AGENT_TOKEN && export VIBORA_AGENT_TOKEN && "
+                    "export VIBORA_AGENT_PORT="+str(args.port)+" VIBORA_EXIT_ON_EOF=1 && exec ./build/vibora "+str(args.gui_port)+" web")
+            tunnel=subprocess.Popen(["ssh","-o","ExitOnForwardFailure=yes","-o","ServerAliveInterval=30",
                 "-L",f"{args.gui_port}:127.0.0.1:{args.gui_port}",
                 "-R",f"{args.port}:127.0.0.1:{args.port}",args.ssh_host,remote],stdin=subprocess.PIPE)
-            tunnel.stdin.write((token+"\n").encode());tunnel.stdin.close()
+            tunnel.stdin.write((token+"\n").encode());tunnel.stdin.flush()
             print("GUI: http://127.0.0.1:"+str(args.gui_port),flush=True)
         server.timeout=1
         while tunnel is None or tunnel.poll() is None: server.handle_request()
