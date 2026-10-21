@@ -7,3 +7,8 @@ pre,code{font-family:Tahoma,Arial,sans-serif}
 #custom-approval{padding:16px;background:#fff7df;border:1px solid #e3cf87;border-radius:8px;margin:15px 0}
 .job-status{position:fixed;bottom:12px;right:20px;z-index:10;background:#d8ec6d}
 header{height:auto;min-height:76px;flex-wrap:wrap;padding-top:12px;padding-bottom:12px}.actions{flex-wrap:wrap}
+
+main,#viewport{min-height:0} .canvas-title,.statusbar,.model-request{flex-shrink:0}
+[hidden]{display:none!important}
+body{height:100vh;display:flex;flex-direction:column}header{flex-shrink:0}.layout{flex:1;min-height:0;height:auto}
+@media(max-width:780px){body{height:auto;display:block}.layout{height:auto}}

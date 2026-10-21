@@ -19,7 +19,7 @@ function add(kind,label,properties={}){
  const view=$('#viewport');let x=view.scrollLeft+Math.max(20,(view.clientWidth-188)/2),y=view.scrollTop+40;
  while(graph.nodes.some(n=>Math.abs(n.x-x)<195&&Math.abs(n.y-y)<130))y+=150;
  const n=Object.assign(node(kind,x,y,label),properties);graph.nodes.push(n);selected=n.id;render();inspect();invalidate();
- document.getElementById(n.id).scrollIntoView({block:'nearest',inline:'nearest'});status('Added '+n.label);return n;
+ view.scrollTo({left:Math.max(0,n.x-(view.clientWidth-188)/2),top:Math.max(0,n.y-40)});status('Added '+n.label);return n;
 }
 function drawWires(){
  const svg=$('#wires');svg.replaceChildren();
