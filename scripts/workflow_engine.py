@@ -230,8 +230,17 @@ class Engine:
    self.log(j,'Model call failed after '+str(round(time.time()-started))+' s: '+str(e)[:300]);raise
   self.log(j,'Model answered in '+str(round(time.time()-started))+' s. '+describe(answer))
   return answer
+ def model_list(self,refresh=False):
+  # Cached so starting a job never waits on provider discovery; Refresh models forces a new check.
+  with self.lock:cached=getattr(self,'_models',None)
+  if refresh or not cached or time.time()-cached[0]>300:
+   cached=(time.time(),self.models())
+   with self.lock:self._models=cached
+  return cached[1]
  def persist(self,j):
+  started=time.time()
   self.rpc({'op':'save_job','id':j['id'],'state':j})
+  if time.time()-started>5:self.log(j,'Saving the job state on Gilbreth took '+str(round(time.time()-started))+' s; SSH or /depot is slow.')
  def update(self,j,**values):
   with self.lock:
    if values.get('summary') and values['summary']!=j.get('summary'):self.log(j,values['summary'])
@@ -242,13 +251,14 @@ class Engine:
   g=request.get('graph');errors=graph_errors(g)
   if errors:raise ValueError('; '.join(errors))
   model=request.get('model',{'provider':'codex','id':'default'})
-  available=self.models()['models']
-  if not any(m['provider']==model.get('provider') and m['id']==model.get('id') for m in available):raise ValueError('Select a model advertised by the connected provider.')
+  listed=lambda models:any(m['provider']==model.get('provider') and m['id']==model.get('id') for m in models['models'])
+  if not listed(self.model_list()) and not listed(self.model_list(refresh=True)):raise ValueError('Select a model advertised by the connected provider.')
   jid=uuid.uuid4().hex
   j={'id':jid,'status':'discovering','graph':g,'graph_hash':digest(g),'model':model,'summary':'Inspecting available MOOSE objects.','created_at':time.time()}
   with self.lock:self.jobs[jid]=j
   self.log(j,'Job created for '+str(model.get('provider'))+' / '+str(model.get('id'))+' with '+str(len(g.get('nodes',[])))+' blocks and '+str(len(g.get('edges',[])))+' connections.')
-  self.persist(j);self.launch(j,self.plan)
+  # Saving on Gilbreth happens in the job thread so the GUI gets the job, and its log, immediately.
+  self.launch(j,self.plan)
   return self.public(j)
  def launch(self,j,fn):
   with self.lock:
@@ -261,6 +271,7 @@ class Engine:
     with self.lock:self.active.discard(j['id'])
   threading.Thread(target=work,daemon=True).start()
  def plan(self,j):
+  self.persist(j)
   self.log(j,'Loading the MOOSE/MARLINS object catalog and retained capabilities from Gilbreth.')
   context=self.rpc({'op':'context','graph':j['graph']})
   self.log(j,'Catalog loaded: '+str(len(context.get('object_paths',[])))+' registered objects, '+str(len(context.get('capabilities',[])))+' retained VIBORA capabilities.')
@@ -430,7 +441,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
  def public(self,j):
   return {k:v for k,v in j.items() if k not in ('context','coding_prompt','package','graph')}
  def request(self,path,data):
-  if path=='/models':return self.models()
+  if path=='/models':return self.model_list(refresh=True)
   if path=='/jobs/start':return self.start(data)
   if path=='/jobs/approve':return self.approve(data)
   if path=='/jobs/reject':return self.reject(data)

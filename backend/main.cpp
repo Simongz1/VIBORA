@@ -207,7 +207,7 @@ int main(int argc,char**argv) {
  // Under the laptop bridge, stdin stays open for the SSH session; EOF means the bridge is gone.
  if(std::getenv("VIBORA_EXIT_ON_EOF"))std::thread([]{std::string line;while(std::getline(std::cin,line)){}std::cerr<<"Bridge disconnected; stopping.\n";std::_Exit(0);}).detach();
  register_workflow(server);
- server.new_task_queue=[] { return new httplib::ThreadPool(4); };
+ server.new_task_queue=[] { return new httplib::ThreadPool(8); };
  server.set_payload_max_length(1024*1024);
  server.set_read_timeout(10,0);server.set_write_timeout(310,0);
  server.Get("/api/catalog",[](const auto&,auto&r){r.set_content(catalog().dump(),"application/json");});

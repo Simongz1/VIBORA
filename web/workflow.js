@@ -2,7 +2,11 @@
 let modelChoices=[], selectedModel={provider:'codex',id:'default'}, currentJob=null, jobSnapshot=null, pollTimer=null;
 try{selectedModel=JSON.parse(localStorage.getItem('vibora-model'))||selectedModel;}catch(e){}
 async function api(path,data){
- const r=await fetch('/api/'+path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+ // The server answers every job call quickly; a missing reply means the bridge or SSH tunnel is stuck.
+ const controller=new AbortController(),limit=setTimeout(()=>controller.abort(),60000);let r;
+ try{r=await fetch('/api/'+path,Object.assign({signal:controller.signal},data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}));}
+ catch(e){throw Error(e.name==='AbortError'?'No reply from the VIBORA server after 60 s. Check the bridge terminal, then try again.':'Cannot reach the VIBORA server ('+e.message+'). Is the bridge running?');}
+ finally{clearTimeout(limit);}
  const text=await r.text();let result;
  try{result=JSON.parse(text);}catch(e){throw Error('Server returned HTTP '+r.status+(text?': '+text.slice(0,300):' with an empty response'));}
  if(!r.ok)throw Error(result.error||'Request failed (HTTP '+r.status+')');return result;
@@ -101,12 +105,13 @@ $('#generate').onclick=async()=>{
  if(generationPending)return;
  clearTimeout(timer);generated='';resolvedGraph=null;setBusy(true);jobSnapshot=JSON.stringify(graph);
  $('#job-dialog').showModal();$('#job-title').textContent='Starting';$('#job-summary').textContent='Creating a MOOSE implementation job…';
+ const started=Date.now(),tick=setInterval(()=>{$('#job-summary').textContent='Creating a MOOSE implementation job… '+Math.round((Date.now()-started)/1000)+' s';},1000);
  $('#job-questions').replaceChildren();$('#job-details').textContent='';$('#custom-approval').hidden=true;$('#view-generated').hidden=true;
  $('#job-log').replaceChildren();$('#run-panel').hidden=true;
  try{
-  const job=await api('jobs/start',{graph:clone(graph),model:selectedModel});
+  const job=await api('jobs/start',{graph:clone(graph),model:selectedModel});clearInterval(tick);
   localStorage.setItem('vibora-job',JSON.stringify({id:job.id,snapshot:jobSnapshot}));showJob(job);
- }catch(e){setBusy(false);$('#job-summary').textContent=e.message;status(e.message);}
+ }catch(e){clearInterval(tick);setBusy(false);$('#job-title').textContent='Could not start';$('#job-summary').textContent=e.message;status(e.message);}
 };
 $('#approve-custom').onclick=async()=>{
  if(!currentJob||currentJob.status!=='awaiting_approval')return;

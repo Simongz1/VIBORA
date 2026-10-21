@@ -29,6 +29,16 @@ class WorkflowTests(unittest.TestCase):
  def test_selected_model_persisted(self):
   e=FakeEngine();j=e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'}})
   self.assertEqual(j['model']['id'],'test-model');self.assertEqual(e.launched,['plan'])
+ def test_start_returns_without_waiting_on_gilbreth(self):
+  e=FakeEngine();j=e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'}})
+  self.assertEqual(e.operations,[]);self.assertEqual(j['log'][0]['message'][:11],'Job created')
+ def test_model_list_cached_and_refreshed_for_new_models(self):
+  e=FakeEngine();calls=[]
+  models=[[{'provider':'local','id':'a'}],[{'provider':'local','id':'a'},{'provider':'claude-code','id':'opus'}]]
+  e.models=lambda:calls.append(1) or {'models':models[min(len(calls)-1,1)]}
+  e.start({'graph':graph(),'model':{'provider':'local','id':'a'}});e.start({'graph':graph(),'model':{'provider':'local','id':'a'}})
+  self.assertEqual(len(calls),1)
+  e.start({'graph':graph(),'model':{'provider':'claude-code','id':'opus'}});self.assertEqual(len(calls),2)
  def test_unavailable_model_rejected(self):
   with self.assertRaises(ValueError):FakeEngine().start({'graph':graph(),'model':{'provider':'local','id':'not-installed'}})
  def pending(self):

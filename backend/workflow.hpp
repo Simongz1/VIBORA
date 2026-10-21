@@ -8,7 +8,7 @@ void workflow_proxy(const std::string& path,const std::string& body,httplib::Res
   httplib::Headers headers;
   if(const char* token=std::getenv("VIBORA_AGENT_TOKEN"))headers.emplace("Authorization",std::string("Bearer ")+token);
   auto result=client.Post(path,headers,body,"application/json");
-  if(!result)throw std::runtime_error("Agent bridge is unreachable.");
+  if(!result)throw std::runtime_error("Agent bridge is unreachable or did not answer within 45 s. Check the bridge terminal on your laptop and restart it if it stopped.");
   r.status=result->status;
   if(json::accept(result->body))r.set_content(result->body,"application/json");
   else r.set_content(json({{"error","Agent bridge returned HTTP "+std::to_string(result->status)+": "+result->body.substr(0,300)}}).dump(),"application/json");
