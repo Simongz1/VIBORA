@@ -19,6 +19,17 @@ There is NO diffusion-only restriction, fixed field count, fixed dimension or fi
 Descriptions express desired physics; respect numerical methods, dimensions, inputs, outputs,
 units and interactions. Block kinds are hints, not a restriction on possible MOOSE syntax.
 Connections may represent coupled physical dependencies, including cycles.
+Use ALL structured params, object_type, category, descriptions and graph edges as evidence.
+A value in params is specified even when the description is empty. Never ask again for it.
+Precedence: explicit model-level requirements override block notes and parameters; explicit
+block descriptions override stored default parameters. Report overrides in the summary.
+Infer variable bindings, material property names and IC targets from connected ports. Multiple
+connections to one port can represent a vector, not ambiguity. Shared ICs apply to each target.
+Resolve obvious object-name typos against the supplied registered catalog and report corrections.
+Use documented MOOSE defaults for omitted optional numerical settings and report assumptions.
+Do not infer physical constants, units, constitutive laws, or initial temperatures from labels.
+Before asking, search the entire graph and requirements; ask only the smallest unresolved
+question and identify the affected block. Do not repeat a discovery-stage question as a fact.
 Never silently replace requested physics with a simpler example. Ask questions for missing
 physical parameters, conflicting descriptions or unspecified conditions needed for a well-defined
 model. Distinguish missing information from unavailable functionality.
@@ -43,6 +54,21 @@ def graph_errors(g):
  for e in g['edges']:
   if not isinstance(e,dict) or e.get('from') not in ids or e.get('to') not in ids:errors.append('Connection references a missing block.')
  return errors
+
+def graph_evidence(g):
+ """Lossless semantic view: retain values and expose connections with readable endpoints."""
+ nodes={n['id']:n for n in g['nodes']}
+ facts=[]
+ for n in g['nodes']:
+  facts.append({'id':n['id'],'label':n.get('label',n['id']),
+   'kind':n.get('kind'),'category':n.get('category'),'object_type':n.get('object_type'),
+   'specified_parameters':n.get('params',{}),
+   'descriptions':{k:n.get(k,'') for k in ('physics','method','implementation')},
+   'incoming':[{'source':nodes[e['from']].get('label',e['from']),
+                'source_id':e['from'],'source_parameters':nodes[e['from']].get('params',{}),
+                'output':e.get('out'),'input':e.get('in')} for e in g['edges'] if e['to']==n['id']]})
+ return {'model_requirements':g.get('request',''),'blocks':facts,
+         'precedence':'Model requirements > explicit block descriptions > stored parameters; report overrides.'}
 
 class Engine:
  def __init__(self,args):
@@ -124,14 +150,26 @@ class Engine:
   threading.Thread(target=work,daemon=True).start()
  def plan(self,j):
   context=self.rpc({'op':'context','graph':j['graph']})
-  discovery=self.llm(j['model'],INSTRUCTIONS+'\nSelect up to 30 object/action names from this catalog whose parameter definitions are needed. Return questions only for genuinely missing model data.\n'+json.dumps({'graph':j['graph'],'catalog':context}),DISCOVERY)
+  evidence=graph_evidence(j['graph']);j['evidence']=evidence
+  discovery=self.llm(j['model'],INSTRUCTIONS+'\nSelect up to 30 object/action names from this catalog whose parameter definitions are needed. Return questions only for genuinely missing model data.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'catalog':context}),DISCOVERY)
   details=self.rpc({'op':'details','paths':discovery['objects']})
   self.update(j,status='planning',summary='Designing the MOOSE input from registered object definitions.')
-  prompt=INSTRUCTIONS+'\nReturn a complete MOOSE input if feasible with existing objects. Otherwise return needs_custom with a concrete proposal, or needs_clarification with questions. No C++ files yet.\n'+json.dumps({'graph':j['graph'],'objects':details,'retained_capabilities':context['capabilities'],'discovery_questions':discovery['questions']})
+  prompt=INSTRUCTIONS+'\nReturn a complete MOOSE input if feasible with existing objects. Otherwise return needs_custom with a concrete proposal, or needs_clarification with questions. No C++ files yet.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'objects':details,'retained_capabilities':context['capabilities'],'discovery_questions':discovery['questions']})
   plan=self.llm(j['model'],prompt,PLAN)
   j['context']={'objects':details,'retained_capabilities':context['capabilities']}
   self.finish_plan(j,plan,prompt)
+ def review_questions(self,j,plan,prompt):
+  if plan['status']!='needs_clarification' and not plan['questions']:return plan
+  self.update(j,status='planning',summary='Checking proposed questions against existing graph settings and connections.')
+  return self.llm(j['model'],prompt+"\nReview the provisional plan below before asking the user anything. "
+   "Answer every proposed question from the graph evidence wherever possible. In particular mesh params "
+   "specify dimensions/resolution, variable blocks specify names, edges specify couplings and IC targets. "
+   "Use model-level requirements to resolve overrides. Remove already-answered questions; regenerate "
+   "the complete input if nothing is missing. Keep genuinely absent physical data as targeted questions, "
+   "not a general setup questionnaire. Do not invent constants to avoid asking.\n"+
+   json.dumps({'provisional_plan':plan,'resolved_graph_evidence':graph_evidence(j['graph'])}),PLAN)
  def finish_plan(self,j,plan,prompt):
+  plan=self.review_questions(j,plan,prompt)
   if plan['status']=='needs_clarification' or plan['questions']:
    self.update(j,status='needs_clarification',summary=plan['summary'],questions=plan['questions'],plan=plan);return
   if plan['status']=='needs_custom':
@@ -143,7 +181,9 @@ class Engine:
     self.update(j,status='ready',summary=plan['summary'],input=plan['input'],plan=plan,validation=check,verification='MOOSE --check-input passed; no full simulation was run.');return
    if attempt<2:
     plan=self.llm(j['model'],prompt+'\nThe input failed MOOSE validation. Repair syntax/parameters; do not simplify the physics.\n'+json.dumps({'previous':plan,'diagnostics':check}),PLAN)
-    if plan['status']!='builtin':
+    if plan['status']!='builtin' or plan['questions']:
+     plan=self.review_questions(j,plan,prompt)
+    if plan['status']!='builtin' or plan['questions']:
      # Validation errors alone are not permission to invent custom code.
      self.update(j,status='needs_clarification',summary=plan['summary'],questions=plan['questions'] or ['Input validation failed. Review the diagnostics and model requirements.'],validation=check);return
   self.update(j,status='failed',summary='MOOSE rejected the input after two repairs.',validation=check,error=check['stdout']+check['stderr'])

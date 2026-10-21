@@ -53,6 +53,50 @@ class WorkflowTests(unittest.TestCase):
   response=e.public(j)
   for k in ('graph','context','coding_prompt','package'):self.assertNotIn(k,response)
 
+class InferenceTests(unittest.TestCase):
+ def setup_graph(self):
+  return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[
+   {'id':'mesh','kind':'mesh','params':{'dim':2,'nx':20,'ny':20}},
+   {'id':'ux','label':'disp_x','kind':'variable','params':{'name':'disp_x'}},
+   {'id':'uy','label':'disp_y','kind':'variable','params':{'name':'disp_y'}},
+   {'id':'ic','category':'ICs','physics':'zero displacement','params':{}},
+   {'id':'material','category':'Materials','params':{}}],
+   'edges':[{'from':'mesh','out':'mesh','to':'ux','in':'mesh'},
+            {'from':'ic','out':'IC','to':'ux','in':'IC'},
+            {'from':'ic','out':'IC','to':'uy','in':'IC'}]}
+ def test_structured_dimension_and_shared_ic_are_exposed_without_mutation(self):
+  g=self.setup_graph();original=copy.deepcopy(g);e=engine.graph_evidence(g)
+  self.assertEqual(e['blocks'][0]['specified_parameters'],{'dim':2,'nx':20,'ny':20})
+  self.assertEqual(e['blocks'][1]['incoming'][0]['source_parameters']['dim'],2)
+  self.assertEqual(e['blocks'][1]['incoming'][1]['source_id'],'ic')
+  self.assertEqual(e['blocks'][2]['incoming'][0]['source_id'],'ic')
+  self.assertEqual(e['blocks'][4]['specified_parameters'],{})
+  self.assertEqual(g,original)
+ def test_redundant_questions_are_reviewed_before_publishing(self):
+  e=FakeEngine();j={'id':'test','graph':self.setup_graph(),'model':{'provider':'local','id':'test'}}
+  prompts=[]
+  def answer(model,prompt,schema):
+   prompts.append(prompt)
+   return {'status':'needs_clarification','summary':'Need material data','rationale':'','objects':[],
+           'questions':['What are the material constants?'],'input':''}
+  e.llm=answer
+  p={'status':'needs_clarification','summary':'Missing mesh','rationale':'','objects':[],
+     'questions':['What is the mesh dimension?','What are the material constants?'],'input':''}
+  e.finish_plan(j,p,'plan')
+  self.assertEqual(j['questions'],['What are the material constants?'])
+  self.assertIn('"dim": 2',prompts[0]);self.assertIn('Run for 10 seconds',prompts[0])
+  self.assertNotIn('check',e.operations)
+ def test_fully_answered_questions_continue_to_moose_validation(self):
+  e=FakeEngine();j={'id':'test','graph':self.setup_graph(),'model':{}}
+  e.llm=lambda *args:{'status':'builtin','summary':'2D setup','rationale':'','objects':[],'questions':[],'input':'model'}
+  rpc=e.rpc
+  e.rpc=lambda p,**kw: {'valid':True} if p['op']=='check' else rpc(p,**kw)
+  e.finish_plan(j,{'status':'needs_clarification','questions':['Dimension?']},'plan')
+  self.assertEqual(j['status'],'ready')
+ def test_valid_plan_does_not_spend_a_review_call(self):
+  e=FakeEngine();e.llm=lambda *a: self.fail('Unexpected LLM call')
+  p={'status':'builtin','questions':[]};self.assertIs(e.review_questions({},p,''),p)
+
 class WorkspaceTests(unittest.TestCase):
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();self.old=(workspace.ROOT,workspace.STATE)
