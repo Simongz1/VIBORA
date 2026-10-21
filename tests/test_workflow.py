@@ -102,6 +102,31 @@ class ClaudeProviderTests(unittest.TestCase):
   status=engine.Engine.models(FakeEngine())['providers']['anthropic']
   self.assertIn('ANTHROPIC_API_KEY',status)
 
+class ClaudeCodeProviderTests(unittest.TestCase):
+ def use(self,stdout,returncode=0):
+  calls=[]
+  def run(cmd,**kwargs):calls.append((cmd,kwargs));return types.SimpleNamespace(returncode=returncode,stdout=stdout(cmd) if callable(stdout) else stdout,stderr='')
+  original=engine.subprocess.run;engine.subprocess.run=run;self.addCleanup(setattr,engine.subprocess,'run',original)
+  e=FakeEngine();e.args.claude='/bin/claude';return e,calls
+ def test_structured_output_returned_without_tools(self):
+  e,calls=self.use(json.dumps({'is_error':False,'structured_output':{'objects':['Kernels/ADHeatConduction'],'questions':[]}}))
+  answer=e.llm({'provider':'claude-code','id':'opus'},'plan this',engine.DISCOVERY)
+  self.assertEqual(answer['objects'],['Kernels/ADHeatConduction'])
+  cmd,kwargs=calls[0]
+  self.assertEqual(json.loads(cmd[cmd.index('--json-schema')+1]),engine.DISCOVERY)
+  self.assertEqual(cmd[cmd.index('--tools')+1],'');self.assertIn('--strict-mcp-config',cmd);self.assertEqual(kwargs['input'],'plan this')
+ def test_cli_errors_fail_the_job_step(self):
+  for stdout,code in [(json.dumps({'is_error':True,'result':'Not logged in · Please run /login'}),1),('not json',1)]:
+   e,calls=self.use(stdout,code)
+   with self.assertRaises(RuntimeError):e.llm({'provider':'claude-code','id':'opus'},'p',engine.DISCOVERY)
+ def test_models_listed_only_when_signed_in(self):
+  for signed_in in (True,False):
+   e,calls=self.use(lambda cmd:json.dumps({'loggedIn':signed_in}) if cmd[1:3]==['auth','status'] else '')
+   result=engine.Engine.models(e)
+   listed=[m['id'] for m in result['models'] if m['provider']=='claude-code']
+   self.assertEqual(listed,engine.CLAUDE_CODE_MODELS if signed_in else [])
+   if not signed_in:self.assertIn('claude auth login',result['providers']['claude-code'])
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[

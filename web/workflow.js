@@ -3,7 +3,9 @@ let modelChoices=[], selectedModel={provider:'codex',id:'default'}, currentJob=n
 try{selectedModel=JSON.parse(localStorage.getItem('vibora-model'))||selectedModel;}catch(e){}
 async function api(path,data){
  const r=await fetch('/api/'+path,data===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
- const result=await r.json();if(!r.ok)throw Error(result.error||'Request failed');return result;
+ const text=await r.text();let result;
+ try{result=JSON.parse(text);}catch(e){throw Error('Server returned HTTP '+r.status+(text?': '+text.slice(0,300):' with an empty response'));}
+ if(!r.ok)throw Error(result.error||'Request failed (HTTP '+r.status+')');return result;
 }
 function modelLabel(){return selectedModel.provider+' / '+selectedModel.id;}
 function setBusy(busy){generationPending=busy;$('#generate').disabled=busy;}

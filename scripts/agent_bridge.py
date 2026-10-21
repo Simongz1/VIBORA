@@ -92,6 +92,7 @@ def main():
     parser.add_argument("--gui-port",type=int,default=18080)
     parser.add_argument("--remote-dir",default="/depot/aamp/data/gonz1075/vibora")
     parser.add_argument("--codex",default=shutil.which("codex") or "/opt/homebrew/bin/codex")
+    parser.add_argument("--claude",help="Claude Code CLI path (default: found on PATH)")
     parser.add_argument("--token-file")
     args=parser.parse_args()
     if not args.token_file and not args.ssh_host:
@@ -105,6 +106,11 @@ def main():
     engine=module.Engine(args)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args): pass
+        def send_error(self,code,message=None,explain=None):
+            # The GUI proxies these responses as JSON, so never send an HTML error page.
+            data=json.dumps({"error":"Agent bridge rejected the request (HTTP "+str(code)+"): "+(message or self.responses.get(code,("",))[0])}).encode()
+            self.send_response(code);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(data)))
+            self.end_headers();self.wfile.write(data)
         def do_POST(self):
             if self.path not in ("/resolve","/models","/jobs/start","/jobs/status","/jobs/approve","/jobs/reject","/graph/check"): self.send_error(404);return
             if not hmac.compare_digest(self.headers.get("Authorization",""),"Bearer "+token):

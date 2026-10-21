@@ -1,5 +1,5 @@
 """Provider-neutral MOOSE coding jobs. Runs inside the authenticated laptop bridge."""
-import hashlib,json,os,re,shlex,subprocess,tempfile,threading,time,uuid
+import hashlib,json,os,re,shlex,shutil,subprocess,tempfile,threading,time,uuid
 from pathlib import Path
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError,URLError
@@ -45,6 +45,15 @@ Return structured JSON only. Do not use tools, commands, external URLs or inspec
 # Claude models that accept effort and structured outputs; the first is the picker default.
 CLAUDE_MODELS=['claude-opus-5-5','claude-sonnet-5-5','claude-haiku-5-5','claude-fable-5-1']
 CLAUDE_FALLBACK_MODELS={'claude-opus-5-5','claude-sonnet-5-5','claude-fable-5-1'}
+
+# Claude Code CLI aliases; the CLI signs in with a Claude subscription (Pro/Max/Team/Enterprise).
+CLAUDE_CODE_MODELS=['opus','sonnet','haiku']
+
+def claude_cli(args):
+ path=getattr(args,'claude',None) or shutil.which('claude')
+ local=Path.home()/'.local/bin/claude'
+ if not path and local.exists():path=str(local)
+ return path
 
 def claude_client():
  # Imported lazily so Codex/local providers work without the SDK installed.
@@ -119,6 +128,16 @@ class Engine:
      choices.append({'id':name,'provider':provider,'name':provider+' — '+name,'available':True})
     status[provider]='Connected'
    except Exception:status[provider]='No local model server connected'
+  cli=claude_cli(self.args)
+  if not cli:status['claude-code']='Claude Code CLI not found; install it or pass --claude'
+  else:
+   try:
+    auth=json.loads(subprocess.run([cli,'auth','status'],text=True,capture_output=True,timeout=20).stdout)
+    if auth.get('loggedIn'):
+     for mid in CLAUDE_CODE_MODELS:choices.append({'id':mid,'provider':'claude-code','name':'Claude Code — '+mid,'available':True})
+     status['claude-code']='Signed in'
+    else:status['claude-code']='Not signed in; run "claude auth login" in a terminal'
+   except (OSError,ValueError,subprocess.TimeoutExpired):status['claude-code']='Claude Code CLI did not report its sign-in status'
   try:
    anthropic,client=claude_client()
    try:listed={m.id for m in client.with_options(timeout=5,max_retries=0).models.list(limit=100)}
@@ -144,6 +163,20 @@ class Engine:
     if p.returncode:raise RuntimeError('Selected Codex model failed: '+p.stderr[-1200:])
     return json.loads((root/'answer.json').read_text())
   if provider=='anthropic':return self.claude(mid,prompt,schema)
+  if provider=='claude-code':
+   cli=claude_cli(self.args)
+   if not cli:raise RuntimeError('Claude Code CLI not found on the laptop.')
+   # No tools, MCP servers or saved sessions: the CLI only answers with schema-validated JSON.
+   cmd=[cli,'-p','--output-format','json','--json-schema',json.dumps(schema),'--tools','','--strict-mcp-config',
+     '--no-session-persistence','--model',mid,'--effort','high',
+     '--system-prompt',"You are VIBORA's MOOSE coding agent. Answer only with the requested structured JSON."]
+   with tempfile.TemporaryDirectory(prefix='vibora-model-') as tmp:
+    p=subprocess.run(cmd,input=prompt,text=True,capture_output=True,timeout=900,cwd=tmp)
+   try:out=json.loads(p.stdout)
+   except ValueError:raise RuntimeError('Selected Claude Code model failed: '+(p.stderr or p.stdout)[-1200:])
+   if p.returncode or out.get('is_error'):raise RuntimeError('Selected Claude Code model failed: '+str(out.get('result') or p.stderr)[-1200:])
+   answer=out.get('structured_output')
+   return answer if isinstance(answer,dict) else json.loads(out['result'])
   if provider not in ('ollama','local'):raise ValueError('Unknown model provider')
   url=os.environ.get('VIBORA_OLLAMA_URL','http://127.0.0.1:11434') if provider=='ollama' else os.environ.get('VIBORA_LOCAL_URL','http://127.0.0.1:8000/v1')
   body={'model':mid,'messages':[{'role':'user','content':prompt}],'stream':False}
