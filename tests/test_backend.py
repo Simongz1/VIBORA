@@ -1,4 +1,7 @@
 import copy
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import pathlib
 import socket
@@ -23,7 +26,28 @@ class BackendTests(unittest.TestCase):
     def setUpClass(cls):
         with socket.socket() as s:
             s.bind(('127.0.0.1',0)); cls.port=s.getsockname()[1]
-        cls.process=subprocess.Popen([BINARY,str(cls.port),WEB],stdout=subprocess.DEVNULL)
+        class Agent(BaseHTTPRequestHandler):
+            def log_message(self,*args): pass
+            def do_POST(self):
+                graph=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                prompt=graph['nodes'][5].get('method','')
+                plan={'summary':'Compiled descriptions','patches':[],'unresolved':[]}
+                if prompt=='unsupported':
+                    plan['unresolved']=['Solid mechanics is not supported yet.']
+                elif prompt=='bad_patch':
+                    plan['patches']=[dict(node='b5',key='shell',value='"bad"',reason='invalid')]
+                elif prompt=='return_to_steady':
+                    plan['patches']=[dict(node='b5',key='type',value='"Steady"',reason='requested')]
+                    plan['patches'] += [dict(node='b5',key=k,value='null',reason='Remove transient settings') for k in ['dt','end_time','scheme']]
+                else:
+                    plan['patches']=[dict(node=n,key=k,value=json.dumps(v),reason='Requested in description')
+                        for n,k,v in [('b5','type','Transient'),('b5','dt',0.1),('b5','end_time',1),('b1','initial_condition',0)]]
+                body=json.dumps(plan).encode();self.send_response(200)
+                self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(body)
+        cls.agent=ThreadingHTTPServer(('127.0.0.1',0),Agent)
+        threading.Thread(target=cls.agent.serve_forever,daemon=True).start()
+        env=dict(os.environ,VIBORA_AGENT_PORT=str(cls.agent.server_port))
+        cls.process=subprocess.Popen([BINARY,str(cls.port),WEB],stdout=subprocess.DEVNULL,env=env)
         for _ in range(100):
             try:
                 urllib.request.urlopen(cls.url('/api/catalog'),timeout=1).close()
@@ -34,7 +58,7 @@ class BackendTests(unittest.TestCase):
             raise RuntimeError('Server failed to start')
     @classmethod
     def tearDownClass(cls):
-        cls.process.terminate();cls.process.wait(timeout=5)
+        cls.process.terminate();cls.process.wait(timeout=5);cls.agent.shutdown();cls.agent.server_close()
     @classmethod
     def url(cls,path): return 'http://127.0.0.1:'+str(cls.port)+path
     def post(self,g,path='/api/validate'):
@@ -80,6 +104,48 @@ class BackendTests(unittest.TestCase):
     def test_cli_matches_http(self):
         p=subprocess.run([BINARY,'--generate'],input=json.dumps(example()),capture_output=True,text=True)
         self.assertEqual(p.returncode,0);self.assertEqual(p.stdout,self.post(example(),'/api/generate')[1]['input'])
+    def transient(self):
+        g=example();g['nodes'][5]['params']={'type':'Transient','dt':0.1,'end_time':1}
+        g['nodes'][1]['params']['initial_condition']=0
+        return g
+    def test_transient_has_accumulation_and_ic(self):
+        status,r=self.post(self.transient(),'/api/generate')
+        self.assertEqual(status,200)
+        for text in ['type = Transient','type = TimeDerivative','initial_condition = 0','dt = 0.1','end_time = 1']:
+            self.assertIn(text,r['input'])
+    def test_transient_missing_requirements(self):
+        for node,key in [(5,'dt'),(5,'end_time'),(1,'initial_condition')]:
+            g=self.transient();del g['nodes'][node]['params'][key]
+            status,r=self.post(g,'/api/generate')
+            self.assertEqual(status,422);self.assertNotIn('input',r)
+    def test_invalid_time_settings(self):
+        for k,v in [('dt',-1),('dt',0),('end_time',0),('num_steps',1.5),('scheme','bad')]:
+            g=self.transient();g['nodes'][5]['params'][k]=v
+            self.assertFalse(self.post(g,'/api/generate')[1]['valid'])
+    def test_agent_changes_actual_input(self):
+        g=example();g['nodes'][5]['method']='Transient dt .1 end 1 initial zero'
+        status,r=self.post(g,'/api/generate')
+        self.assertEqual(status,200);self.assertIn('type = TimeDerivative',r['input'])
+        self.assertEqual(r['resolvedGraph']['nodes'][5]['params']['type'],'Transient')
+        self.assertEqual(len(r['changes']),4)
+    def test_unresolved_never_returns_input(self):
+        g=example();g['nodes'][5]['method']='unsupported'
+        status,r=self.post(g,'/api/generate')
+        self.assertEqual(status,422);self.assertNotIn('input',r)
+    def test_agent_patch_allowlist(self):
+        g=example();g['nodes'][5]['method']='bad_patch'
+        self.assertFalse(self.post(g,'/api/generate')[1]['valid'])
+    def test_agent_can_return_to_steady(self):
+        g=self.transient();g['nodes'][5]['method']='return_to_steady'
+        status,r=self.post(g,'/api/generate')
+        self.assertEqual(status,200);self.assertIn('type = Steady',r['input'])
+        self.assertNotIn('TimeDerivative',r['input']);self.assertNotIn('dt =',r['input'])
+    def test_offline_agent_does_not_ignore_descriptions(self):
+        g=example();g['nodes'][5]['method']='Transient'
+        env=dict(os.environ);env.pop('VIBORA_AGENT_PORT',None)
+        p=subprocess.run([BINARY,'--generate'],input=json.dumps(g),capture_output=True,text=True,env=env)
+        self.assertNotEqual(p.returncode,0);self.assertEqual(p.stdout,'')
+        self.assertIn('offline',p.stderr)
     def test_web(self):
         with urllib.request.urlopen(self.url('/')) as r:self.assertIn(b'VIBORA',r.read())
         with urllib.request.urlopen(self.url('/api/catalog')) as r:self.assertEqual(len(json.load(r)),6)

@@ -5,3 +5,5 @@
 __pycache__/
 /third_party/*.h
 /third_party/*.hpp
+
+.agent-token
