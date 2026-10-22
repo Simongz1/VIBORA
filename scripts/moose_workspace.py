@@ -335,6 +335,30 @@ def run_cancel(jid):
  r=run(['scancel',meta['id']],timeout=20)
  if r['returncode']!=0:raise RuntimeError(r['stderr'] or 'scancel failed')
  meta['cancelled']=True;save(folder/'scheduler.json',meta);return {'cancelling':True}
+GIT_IDENTITY=['-c','user.name=VIBORA','-c','user.email=vibora@localhost']
+def git(*args,timeout=60):
+ return run(['git']+GIT_IDENTITY+list(args),cwd=ROOT,timeout=timeout,env=dict(os.environ,GIT_TERMINAL_PROMPT='0'))
+def sync_with_origin():
+ # Put the new capability commit on top of GitHub before pushing, so both sides stay fast-forwardable.
+ branch=git('rev-parse','--abbrev-ref','HEAD')['stdout'].strip()
+ if not branch or branch=='HEAD':return {'pushed':False,'message':'The Gilbreth checkout is not on a branch; the capability commit stays local.'}
+ fetch=git('fetch','origin',branch)
+ if fetch['returncode']!=0:return {'pushed':False,'message':'Could not fetch '+branch+' from GitHub: '+(fetch['stderr'] or fetch['stdout']).strip()[-300:]}
+ upstream='origin/'+branch;before=git('rev-parse','HEAD')['stdout'].strip()
+ pulled=[l for l in git('log','--format=%h %s','HEAD..'+upstream)['stdout'].splitlines() if l]
+ if pulled:
+  dirty=git('status','--porcelain','--untracked-files=no')['stdout'].strip()
+  if dirty:return {'pushed':False,'message':'GitHub has '+str(len(pulled))+' newer commit(s), but the Gilbreth checkout has uncommitted changes, so it was not rebased; the capability commit stays local.','dirty':dirty.splitlines()[:20]}
+  rebase=git('rebase',upstream,timeout=120)
+  if rebase['returncode']!=0:
+   git('rebase','--abort')
+   return {'pushed':False,'message':'Rebasing the capability commit onto GitHub hit a conflict; the rebase was aborted and the commit stays local.','conflict':(rebase['stdout']+rebase['stderr']).strip()[-1500:]}
+ backend=[f for f in git('diff','--name-only',before,'HEAD','--','backend','CMakeLists.txt','third_party')['stdout'].splitlines() if f] if pulled else []
+ push=git('push','origin','HEAD:'+branch,timeout=60)
+ result={'pushed':push['returncode']==0,'pulled':pulled,'rebuild_needed':bool(backend)}
+ if push['returncode']!=0:result['message']='Push to GitHub failed: '+(push['stderr'] or push['stdout']).strip()[-300:]
+ else:result['message']='Capability pushed to GitHub'+(' after rebasing onto '+str(len(pulled))+' newer commit(s)' if pulled else '')+'.'+(' Those commits changed the C++ server; rebuild with cmake --build build.' if backend else '')
+ return result
 def promote(jid):
  folder=jobdir(jid);result=json.loads((folder/'build_result.json').read_text())
  if not result.get('passed'):raise ValueError('Cannot retain an unverified implementation')
@@ -353,9 +377,10 @@ def promote(jid):
   # Commit only files produced by this approved implementation.
   paths=['moose_app/'+f['path'] for f in package['files']]+[str(cap.relative_to(ROOT))]
   run(['git','add','--']+paths,cwd=ROOT)
-  commit=run(['git','-c','user.name=VIBORA','-c','user.email=vibora@localhost','commit','--only','-m','Add verified custom MOOSE capability '+jid[:8],'--']+paths,cwd=ROOT)
-  push=run(['git','push','origin','HEAD'],cwd=ROOT,timeout=30,env=dict(os.environ,GIT_TERMINAL_PROMPT='0')) if commit['returncode']==0 else {'returncode':1,'stderr':'Commit failed'}
-  return {'retained':True,'capability':jid,'manifest':str(cap/'manifest.json'),'commit':commit,'push':push,'sync_pending':push['returncode']!=0}
+  commit=git('commit','--only','-m','Add verified custom MOOSE capability '+jid[:8],'--',*paths)
+  sync=sync_with_origin() if commit['returncode']==0 else {'pushed':False,'message':'Commit failed: '+(commit['stderr'] or commit['stdout']).strip()[-300:]}
+  return {'retained':True,'capability':jid,'manifest':str(cap/'manifest.json'),'commit':commit,'sync':sync,
+          'sync_pending':not sync['pushed'],'sync_message':sync['message']}
 def dispatch(r):
  op=r['op'];jid=r.get('id')
  if op=='context':return context(r)

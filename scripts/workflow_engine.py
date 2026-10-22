@@ -584,7 +584,8 @@ a sufficient test. Tests run serially with a 120-second limit each.
     self.log(j,'Slurm job finished at the '+str(result.get('phase','?'))+' phase: '+str(sum(t['passed'] for t in tests))+' of '+str(len(tests))+' numerical test(s) passed.')
     if result.get('passed'):
      self.update(j,status='retaining',summary='Build and numerical tests passed. Retaining the new capability.',test_result=result)
-     retained=self.rpc({'op':'promote','id':j['id']},timeout=90)
+     retained=self.rpc({'op':'promote','id':j['id']},timeout=300)
+     if retained.get('sync_message'):self.log(j,'GitHub: '+retained['sync_message'])
      self.update(j,status='ready',summary=j['package']['summary'],input=j['package']['input'],retained=retained,test_result=result,
                  verification='Compiled; MOOSE input checked; new and retained numerical regression tests passed.')
      return

@@ -339,6 +339,63 @@ class OutputEditTests(unittest.TestCase):
  def test_generation_prompt_explains_visualize(self):
   self.assertIn('never write visualize itself into the input',engine.INSTRUCTIONS)
 
+class PromoteSyncTests(unittest.TestCase):
+ """promote() with real git repositories: a bare origin, the Gilbreth checkout, and a laptop clone."""
+ def git(self,cwd,*args):
+  return subprocess.run(['git','-c','user.name=T','-c','user.email=t@t','-c','init.defaultBranch=main']+list(args),cwd=cwd,check=True,capture_output=True,text=True).stdout.strip()
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();base=Path(self.tmp.name)
+  self.old=(workspace.ROOT,workspace.STATE)
+  self.origin=base/'origin.git';self.git(base,'init','--bare','-b','main',str(self.origin))
+  root=base/'gilbreth';self.git(base,'clone',str(self.origin),str(root))
+  (root/'moose_app/src/base').mkdir(parents=True);(root/'moose_app/src/base/App.C').write_text('base')
+  (root/'README.md').write_text('readme\n');(root/'.gitignore').write_text('.vibora/\n')
+  self.git(root,'add','.');self.git(root,'commit','-m','initial');self.git(root,'push','origin','main')
+  self.laptop=base/'laptop';self.git(base,'clone',str(self.origin),str(self.laptop))
+  workspace.ROOT=root;workspace.STATE=root/'.vibora';workspace.STATE.mkdir()
+  self.jid='c'*32;folder=workspace.jobdir(self.jid)
+  workspace.save(folder/'build_result.json',{'passed':True,'executable':'/apps/vibora-opt'})
+  workspace.save(folder/'baseline.json',{'digest':workspace.app_digest()})
+  workspace.save(folder/'approval.json',{'plan_hash':'p'})
+  workspace.save(folder/'package.json',{'summary':'test kernel','objects':['Test'],'tests':[],'input':'[Mesh]\n[]','files':[{'path':'src/kernels/Test.C'}]})
+  (folder/'app/src/kernels').mkdir(parents=True);(folder/'app/src/kernels/Test.C').write_text('verified kernel\n')
+ def tearDown(self):
+  workspace.ROOT,workspace.STATE=self.old;self.tmp.cleanup()
+ def laptop_commit(self,path,text):
+  f=self.laptop/path;f.parent.mkdir(parents=True,exist_ok=True);f.write_text(text)
+  self.git(self.laptop,'add',path);self.git(self.laptop,'commit','-m','laptop change '+path);self.git(self.laptop,'push','origin','main')
+ def origin_log(self):return self.git(workspace.ROOT,'log','--format=%s','origin/main')
+ def test_push_without_newer_github_commits(self):
+  r=workspace.promote(self.jid)
+  self.assertFalse(r['sync_pending']);self.assertEqual(r['sync']['pulled'],[])
+  self.git(workspace.ROOT,'fetch','origin');self.assertIn('Add verified custom MOOSE capability cccccccc',self.origin_log())
+ def test_rebases_onto_newer_github_commits_then_pushes(self):
+  self.laptop_commit('README.md','readme\nnew docs\n')
+  r=workspace.promote(self.jid)
+  self.assertFalse(r['sync_pending'],r['sync_message']);self.assertEqual(len(r['sync']['pulled']),1);self.assertFalse(r['sync']['rebuild_needed'])
+  self.git(workspace.ROOT,'fetch','origin')
+  self.assertEqual(self.git(workspace.ROOT,'rev-parse','HEAD'),self.git(workspace.ROOT,'rev-parse','origin/main'))
+  self.assertEqual(self.origin_log().splitlines()[:2],['Add verified custom MOOSE capability cccccccc','laptop change README.md'])
+  self.assertEqual((workspace.ROOT/'README.md').read_text(),'readme\nnew docs\n')
+ def test_backend_changes_from_github_ask_for_rebuild(self):
+  self.laptop_commit('backend/main.cpp','int main(){}\n')
+  r=workspace.promote(self.jid)
+  self.assertTrue(r['sync']['rebuild_needed']);self.assertIn('rebuild',r['sync_message'])
+ def test_conflict_aborts_rebase_and_keeps_commit_local(self):
+  self.laptop_commit('moose_app/src/kernels/Test.C','a different kernel\n')
+  before=self.git(self.laptop,'rev-parse','HEAD')
+  r=workspace.promote(self.jid)
+  self.assertTrue(r['sync_pending']);self.assertIn('conflict',r['sync_message']);self.assertIn('Test.C',r['sync']['conflict'])
+  self.assertFalse((workspace.ROOT/'.git/rebase-merge').exists());self.assertFalse((workspace.ROOT/'.git/rebase-apply').exists())
+  self.assertEqual(self.git(workspace.ROOT,'log','-1','--format=%s'),'Add verified custom MOOSE capability cccccccc')
+  self.assertEqual(self.git(workspace.ROOT,'status','--porcelain','--untracked-files=no'),'')
+  self.assertEqual(self.git(workspace.ROOT,'rev-parse','origin/main'),before)
+ def test_uncommitted_changes_block_the_rebase(self):
+  self.laptop_commit('README.md','from github\n');(workspace.ROOT/'README.md').write_text('local edit\n')
+  r=workspace.promote(self.jid)
+  self.assertTrue(r['sync_pending']);self.assertIn('uncommitted changes',r['sync_message']);self.assertEqual(r['sync']['dirty'],['M README.md'])
+  self.assertEqual((workspace.ROOT/'README.md').read_text(),'local edit\n')
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[

@@ -192,7 +192,7 @@ $('#view-generated').onclick=()=>{
  if(!currentJob?.input)return;
  generated=currentJob.input;$('#input-preview').textContent=generated;$('#agent-summary').textContent=currentJob.summary;
  $('#agent-changes').replaceChildren(el('li',currentJob.verification||''));
- if(currentJob.retained)$('#agent-changes').append(el('li','Retained capability: '+currentJob.retained.capability+(currentJob.retained.sync_pending?' · GitHub synchronization pending.':'')));
+ if(currentJob.retained)$('#agent-changes').append(el('li','Retained capability: '+currentJob.retained.capability+(currentJob.retained.sync_pending?' · GitHub synchronization pending: '+(currentJob.retained.sync_message||'push failed'):'')));
  $('#apply-resolved').hidden=true;$('#save-resolved').hidden=true;
  $('#job-dialog').close();$('#preview').showModal();
 };
