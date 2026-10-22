@@ -62,6 +62,57 @@ def describe(answer):
  if answer.get('summary'):parts.append(str(answer['summary'])[:300])
  return ' '.join(parts)
 
+def hit_blocks(text):
+ # Minimal MOOSE input (HIT) reader for summaries: {'Materials/stress': {'type': ...}}. Not a validator.
+ blocks={};path=[]
+ for raw in str(text or '').splitlines():
+  line=raw.split('#',1)[0].strip()
+  if not line:continue
+  m=re.fullmatch(r'\[\s*(?:\./)?([^\]\s]*)\s*\]',line)
+  if m:
+   if m.group(1) in ('','..'):path=path[:-1]
+   else:path=path+[m.group(1)];blocks.setdefault('/'.join(path),{})
+   continue
+  m=re.match(r'([A-Za-z_][\w:/.-]*)\s*=\s*(.*)',line)
+  if m and path:blocks['/'.join(path)][m.group(1)]=m.group(2).strip().strip('\'"').strip()
+ return blocks
+
+def summarize_input(text):
+ # What will actually run: mesh size, resolution and constitutive model, read from the generated input.
+ blocks=hit_blocks(text);num=lambda v,d:float(v) if re.fullmatch(r'[-+0-9.eE]+',str(v or '')) else d
+ fmt=lambda v:('%g'%v)
+ summary={'mesh_size':'Not specified in the input','resolution':'Not specified in the input','constitutive_model':[]}
+ mesh=next((p for k,p in blocks.items() if k.split('/')[0]=='Mesh' and ('dim' in p or 'nx' in p)),None)
+ meshfile=next((p.get('file') for k,p in blocks.items() if k.split('/')[0]=='Mesh' and p.get('file')),None)
+ if mesh:
+  dim=int(num(mesh.get('dim'),1));axes='xyz'[:dim]
+  lo=[num(mesh.get(a+'min'),0) for a in axes];hi=[num(mesh.get(a+'max'),1) for a in axes]
+  summary['mesh_size']=' × '.join(fmt(h-l) for l,h in zip(lo,hi))+' ('+', '.join(a+': '+fmt(l)+' to '+fmt(h) for a,l,h in zip(axes,lo,hi))+')'
+  n=[int(num(mesh.get('n'+a),1)) for a in axes];total=1
+  for k in n:total*=k
+  summary['resolution']=' × '.join(map(str,n))+' = '+str(total)+' '+mesh.get('elem_type',['EDGE2','QUAD4','HEX8'][dim-1])+' elements'
+ elif meshfile:summary['mesh_size']=summary['resolution']='From mesh file '+meshfile
+ # Properties defined by constant-material blocks, to resolve names such as bulk_modulus = bulk.
+ values={}
+ for k,p in blocks.items():
+  if k.startswith('Materials/') and p.get('prop_names'):values.update(zip(p['prop_names'].split(),p.get('prop_values','').split()))
+ used=set()
+ for k,p in blocks.items():
+  if not k.startswith('Materials/') or not p.get('type') or p.get('prop_names'):continue
+  params=[]
+  for key,value in p.items():
+   if key in ('type','block','boundary','constant_on','outputs') or key.endswith('_name'):continue
+   if value in values:used.add(value);params.append(key+' = '+values[value]+' ('+value+')')
+   elif re.fullmatch(r'[-+0-9.eE]+',value) or re.search(r'modulus|ratio|lambda|density|youngs|poisson|yield|conductivity|specific_heat|expansion|form',key):params.append(key+' = '+value)
+  summary['constitutive_model'].append(p['type']+(' ('+', '.join(params)+')' if params else ''))
+ for k,p in blocks.items():
+  if k.startswith('Materials/') and p.get('prop_names') and not used.intersection(p['prop_names'].split()):
+   summary['constitutive_model'].append(p.get('type','Material')+' ('+', '.join(a+' = '+b for a,b in zip(p['prop_names'].split(),p.get('prop_values','').split()))+')')
+ kinematics=[p.get(key)+' '+key for k,p in blocks.items() if k.split('/')[0] in ('Physics','Modules') for key in ('formulation','strain') if p.get(key)]
+ if kinematics:summary['constitutive_model'].append('Kinematics: '+', '.join(dict.fromkeys(kinematics)))
+ if not summary['constitutive_model']:summary['constitutive_model']=['No material blocks in the input']
+ return summary
+
 def claude_cli(args):
  path=getattr(args,'claude',None) or shutil.which('claude')
  local=Path.home()/'.local/bin/claude'
@@ -439,7 +490,9 @@ a sufficient test. Tests run serially with a 120-second limit each.
   except Exception as e:
    self.update(j,run=dict(j.get('run') or {},status='failed',error=str(e)));self.log(j,'Lost track of the simulation: '+str(e)[:400])
  def public(self,j):
-  return {k:v for k,v in j.items() if k not in ('context','coding_prompt','package','graph')}
+  public={k:v for k,v in j.items() if k not in ('context','coding_prompt','package','graph')}
+  if j.get('input'):public['model_summary']=summarize_input(j['input'])
+  return public
  def request(self,path,data):
   if path=='/models':return self.model_list(refresh=True)
   if path=='/jobs/start':return self.start(data)

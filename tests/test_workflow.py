@@ -207,6 +207,22 @@ class SimulationRunTests(unittest.TestCase):
   e.rpc=broken;e.persist=lambda j:None;e.monitor_run(j)
   self.assertEqual(j['run']['status'],'failed');self.assertEqual(j['status'],'ready')
 
+class ModelSummaryTests(unittest.TestCase):
+ def test_example_input_summary(self):
+  summary=engine.summarize_input((ROOT/'examples/mechanics.i').read_text())
+  self.assertEqual(summary['mesh_size'],'1 × 1 (x: 0 to 1, y: 0 to 1)')
+  self.assertEqual(summary['resolution'],'20 × 20 = 400 QUAD4 elements')
+  self.assertIn('ComputeLagrangianCompressibleNeoHookeanStress (bulk_modulus = 1e9 (bulk), shear_modulus = 1e9 (shear)',summary['constitutive_model'][0])
+  self.assertEqual(summary['constitutive_model'][-1],'Kinematics: UPDATED formulation, FINITE strain')
+ def test_mesh_generator_and_missing_blocks(self):
+  summary=engine.summarize_input('[Mesh]\n [gen]\n  type = GeneratedMeshGenerator\n  dim = 3\n  nx = 4\n  ny = 5\n  nz = 2\n  xmax = 2e-3 # mm\n []\n[]')
+  self.assertEqual(summary['resolution'],'4 × 5 × 2 = 40 HEX8 elements');self.assertTrue(summary['mesh_size'].startswith('0.002 × 1 × 1'))
+  self.assertEqual(summary['constitutive_model'],['No material blocks in the input'])
+  self.assertEqual(engine.summarize_input('[Mesh]\n file = part.e\n[]')['resolution'],'From mesh file part.e')
+ def test_public_job_includes_summary_only_with_input(self):
+  e=FakeEngine();self.assertNotIn('model_summary',e.public({'id':'x'}))
+  self.assertIn('resolution',e.public({'id':'x','input':'[Mesh]\n dim = 1\n nx = 8\n[]'})['model_summary'])
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[
@@ -326,6 +342,24 @@ class WorkspaceTests(unittest.TestCase):
   workspace.save(folder/'scheduler.json',{'mode':'login','node':'login03','time':'00:10:00','submitted_at':time.time()-600})
   status=workspace.run_status(self.jid)
   self.assertEqual(status['status'],'failed');self.assertIn('stopped without finishing',status['error'])
+
+ def test_run_scripts_write_exodus_and_render_images(self):
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'[Mesh]\n[]'})
+  original=workspace.run;workspace.run=lambda args,**kw:{'returncode':0,'stdout':'5\n','stderr':''}
+  self.addCleanup(setattr,workspace,'run',original)
+  workspace.run_submit(self.jid,'[Mesh]\n[]',2,'')
+  script=(workspace.jobdir(self.jid)/'run/run.sbatch').read_text()
+  self.assertIn('Outputs/exodus=true',script);self.assertIn('render_results.py',script)
+  self.assertLess(script.index('code=$?'),script.index('render_results.py'));self.assertTrue(script.rstrip().endswith('echo $code > exit_code'))
+ def test_run_status_reports_rendered_images(self):
+  folder=workspace.jobdir(self.jid)/'run';(folder/'images').mkdir(parents=True)
+  workspace.save(folder/'scheduler.json',{'id':'7'});(folder/'exit_code').write_text('0')
+  workspace.save(folder/'images/manifest.json',{'deformed':True,'images':[{'variable':'temp','time':1.0,'step':3,'file':'temp_003.png'}]})
+  status=workspace.run_status(self.jid)
+  self.assertEqual(status['images'][0]['file'],'temp_003.png');self.assertTrue(status['images_deformed'])
+  self.assertNotIn('images',[f['name'] for f in status['outputs']])
+  workspace.save(folder/'images/manifest.json',{'error':'Result images need numpy'})
+  self.assertEqual(workspace.run_status(self.jid)['images_error'],'Result images need numpy')
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())

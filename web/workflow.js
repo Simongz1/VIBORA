@@ -67,9 +67,39 @@ function showRun(job){
  if(run.scheduler_log)details.scheduler_log=run.scheduler_log;
  let text=Object.keys(details).length?JSON.stringify(details,null,2):'';
  if(run.log_tail&&!active)text+=(text?'\n\n':'')+'MOOSE log (end):\n'+run.log_tail;
- $('#run-details').hidden=!text;$('#run-details').textContent=text;
+ $('#run-details').textContent=text;$('#run-tech').hidden=!text;
+ openOnce('#run-tech',job.id+':run:'+run.status+':'+(run.scheduler_id||run.node||''),run.status==='failed');
+ showSummary(job.model_summary);showImages(job,run);
  return active;
 }
+// Opens a collapsed details section once per state change, so the user's own toggling is kept.
+const opened={};
+function openOnce(selector,key,open){if(opened[selector]!==key){opened[selector]=key;$(selector).open=open;}}
+function showSummary(summary){
+ const box=$('#model-summary');box.replaceChildren();if(!summary)return;
+ for(const [label,value] of [['Mesh size',summary.mesh_size],['Resolution',summary.resolution],['Constitutive model',summary.constitutive_model]]){
+  const dd=el('dd');for(const line of [].concat(value))dd.append(el('div',line));
+  box.append(el('dt',label),dd);
+ }
+}
+let galleryKey='';
+function showImages(job,run){
+ const images=run.images||[],variables=[...new Set(images.map(i=>i.variable))];
+ $('#run-images').hidden=!(images.length||run.images_error)||RUN_ACTIVE.includes(run.status);
+ $('#run-images-note').textContent=run.images_error||(run.images_deformed?'Shown on the deformed mesh.':'');
+ const select=$('#run-variable'),chosen=variables.includes(select.value)?select.value:variables[0];
+ const key=JSON.stringify([job.id,run.scheduler_id,run.node,images,chosen]);if(key===galleryKey)return;galleryKey=key;
+ select.replaceChildren(...variables.map(v=>{const o=el('option',v);o.value=v;o.selected=v===chosen;return o;}));
+ $('.run-variable').hidden=variables.length<2;
+ const stamp=encodeURIComponent(String(run.scheduler_id||run.node||'')+(run.returncode??''));
+ $('#run-frames').replaceChildren(...images.filter(i=>i.variable===chosen).map(i=>{
+  const url='/api/jobs/'+job.id+'/images/'+encodeURIComponent(i.file)+'?v='+stamp;
+  const link=el('a');link.href=url;link.target='_blank';link.rel='noopener';
+  const img=el('img');img.src=url;img.alt=i.variable+' at t = '+Number(i.time.toPrecision(6));img.loading='lazy';link.append(img);
+  const figure=el('figure');figure.append(link,el('figcaption','t = '+Number(i.time.toPrecision(6))));return figure;
+ }));
+}
+$('#run-variable').onchange=()=>{galleryKey='';if(currentJob)showImages(currentJob,currentJob.run||{});};
 function showJob(job){
  currentJob=job;$('#job-status').hidden=false;
  $('#job-title').textContent=job.status.replaceAll('_',' ');
@@ -90,7 +120,8 @@ function showJob(job){
  if(job.test_result)details.build_and_tests=job.test_result;
  if(job.retained)details.retained_capability=job.retained;
  if(job.error)details.error=job.error;
- $('#job-details').textContent=Object.keys(details).length?JSON.stringify(details,null,2):'';$('#job-details').hidden=!Object.keys(details).length;
+ $('#job-details').textContent=Object.keys(details).length?JSON.stringify(details,null,2):'';
+ $('#job-tech').hidden=!Object.keys(details).length;openOnce('#job-tech',job.id+':'+job.status,job.status==='failed');
  const terminal=['ready','failed','needs_clarification','awaiting_approval','cancelled'].includes(job.status);
  const running=showRun(job);renderLog(job.log||[],!terminal||running);
  setBusy(!terminal);status(running?'Simulation: '+runText(job.run):job.status+': '+(job.summary||job.error||''));

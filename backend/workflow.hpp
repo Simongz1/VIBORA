@@ -22,5 +22,12 @@ void register_workflow(httplib::Server& server) {
    workflow_proxy("/jobs/"+action,req.body,r);
   });
  }
+ // Result snapshots written by scripts/render_results.py into each job's run folder.
+ server.Get(R"(/api/jobs/([a-f0-9]{32})/images/([A-Za-z0-9_.-]{1,120}\.png))",[](const httplib::Request& req,httplib::Response& r){
+  const char* state=std::getenv("VIBORA_STATE_DIR");
+  std::ifstream file(std::string(state?state:".vibora")+"/jobs/"+req.matches[1].str()+"/run/images/"+req.matches[2].str(),std::ios::binary);
+  if(!file){r.status=404;r.set_content(R"({"error":"Result image not found."})","application/json");return;}
+  std::ostringstream data;data<<file.rdbuf();r.set_content(data.str(),"image/png");
+ });
  server.Post("/api/graph/check",[](const auto& req,auto& r){workflow_proxy("/graph/check",req.body,r);});
 }

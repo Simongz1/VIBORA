@@ -25,3 +25,4 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME graph_and_generation COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_backend.py $<TARGET_FILE:vibora> ${CMAKE_SOURCE_DIR}/web)
 
 add_test(NAME workflow_and_approval COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_workflow.py)
+add_test(NAME result_images COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_render.py)

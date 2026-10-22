@@ -171,7 +171,7 @@ def build_status(jid):
  if state:return {'status':'running' if state.startswith('RUNNING') else 'queued','scheduler':state,'scheduler_id':sid}
  log=(folder/'scheduler.log').read_text()[-8000:] if (folder/'scheduler.log').exists() else ''
  return {'status':'failed','error':'Scheduler job ended without a build result.','log':log,'scheduler_id':sid}
-RUN_FILES={'model.i','run.sbatch','run.sh','scheduler.json','exit_code','node','slurm.log','heartbeat','cancel','launcher.log'}
+RUN_FILES={'model.i','run.sbatch','run.sh','scheduler.json','exit_code','node','slurm.log','heartbeat','cancel','launcher.log','render.log'}
 LOGIN_MAX_RANKS=4
 LOGIN_MAX_SECONDS=3600
 def run_results(folder):
@@ -185,6 +185,11 @@ def run_results(folder):
  if csvs:
   with csvs[0].open() as f:rows=list(csv.DictReader(f))
   if rows:result['postprocessors']=rows[-1];result['csv']=csvs[0].name;result['csv_rows']=len(rows)
+ manifest=folder/'images'/'manifest.json'
+ if manifest.exists():
+  m=json.loads(manifest.read_text());result['images']=m.get('images',[])
+  if m.get('error'):result['images_error']=m['error']
+  if m.get('deformed'):result['images_deformed']=True
  return result
 def seconds(wall):
  h,m,s=(int(x) for x in wall.split(':'));return h*3600+m*60+s
@@ -208,21 +213,25 @@ def run_submit(jid,text,ranks,wall,where='slurm'):
  head=('#!/bin/bash\nset -uo pipefail\ncd '+shlex.quote(str(folder))+'\n'
   +('export PATH='+shlex.quote(toolchain)+':"$PATH"\n' if toolchain else '')
   +'export OMP_NUM_THREADS=1\nhostname > node\n')
- moose='mpiexec -n '+str(ranks)+' '+shlex.quote(str(executable()))+' -i model.i Outputs/csv=true > moose.log 2>&1'
+ moose='mpiexec -n '+str(ranks)+' '+shlex.quote(str(executable()))+' -i model.i Outputs/csv=true Outputs/exodus=true > moose.log 2>&1'
+ # Result images come from the Exodus output; a rendering problem never changes the run's exit code.
+ render=shlex.quote(CONFIG.get('render_python','python3'))+' '+shlex.quote(str(ROOT/'scripts'/'render_results.py'))+' . > render.log 2>&1'
  if where=='login':
   # Status checks may reach a different login node, so all state lives in files on the shared filesystem:
   # a heartbeat while running, a cancel flag the loop obeys, and the exit code at the end.
   script=folder/'run.sh'
   script.write_text(head+'timeout --signal=TERM '+str(seconds(wall))+' '+moose+' &\nchild=$!\n'
-   +'while kill -0 "$child" 2>/dev/null; do touch heartbeat; [ -f cancel ] && kill -TERM "$child"; sleep 5; done\n'
-   +'wait "$child"; echo $? > exit_code\n')
+   +'watch(){ while kill -0 "$1" 2>/dev/null; do touch heartbeat; [ -f cancel ] && kill -TERM "$1"; sleep 5; done; }\n'
+   +'watch "$child"; wait "$child"; code=$?\n'
+   +'if [ ! -f cancel ]; then '+render+' & child=$!; watch "$child"; wait "$child"; fi\n'
+   +'echo $code > exit_code\n')
   with (folder/'launcher.log').open('w') as log:
    subprocess.Popen(['bash',str(script)],cwd=folder,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
   node=os.uname().nodename
   save(folder/'scheduler.json',{'mode':'login','node':node,'ranks':ranks,'time':wall,'submitted_at':time.time()})
   return {'mode':'login','scheduler_id':None,'node':node,'ranks':ranks,'time':wall,'folder':str(folder)}
  script=folder/'run.sbatch'
- script.write_text(head+moose+'\necho $? > exit_code\n')
+ script.write_text(head+moose+'\ncode=$?\n'+render+' || true\necho $code > exit_code\n')
  args=['sbatch','--parsable','--job-name','vibora-run-'+jid[:8],'--account',cfg['account'],'--partition',cfg['partition'],'--qos',cfg['qos'],
        '--gres','gpu:'+str(cfg.get('gpus',1)),'--time',wall,'--ntasks',str(ranks),'--cpus-per-task','1','--mem',cfg['memory'],
        '--output',str(folder/'slurm.log'),str(script)]

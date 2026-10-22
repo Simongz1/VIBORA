@@ -171,4 +171,24 @@ class ServerLifecycleTests(unittest.TestCase):
         self.addCleanup(lambda: server.poll() is None and server.kill());self.wait_up(port)
         server.stdin.close();self.assertEqual(server.wait(timeout=10),0)
 
+class ResultImageTests(unittest.TestCase):
+    def test_images_served_only_from_run_folders(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as state:
+            jid='a'*32;images=pathlib.Path(state)/'jobs'/jid/'run'/'images';images.mkdir(parents=True)
+            (images/'temp_003.png').write_bytes(b'\x89PNG fake');(pathlib.Path(state)/'secret.png').write_bytes(b'secret')
+            with socket.socket() as s:
+                s.bind(('127.0.0.1',0));port=s.getsockname()[1]
+            server=subprocess.Popen([BINARY,str(port),WEB],stdout=subprocess.DEVNULL,env=dict(os.environ,VIBORA_STATE_DIR=state))
+            self.addCleanup(server.wait);self.addCleanup(server.terminate)
+            base='http://127.0.0.1:%d/api/jobs/'%port
+            for _ in range(50):
+                try: urllib.request.urlopen('http://127.0.0.1:%d/api/catalog'%port,timeout=1).close();break
+                except OSError: time.sleep(.1)
+            with urllib.request.urlopen(base+jid+'/images/temp_003.png') as r:
+                self.assertEqual(r.headers['Content-Type'],'image/png');self.assertEqual(r.read(),b'\x89PNG fake')
+            for bad in (jid+'/images/missing.png',jid+'/images/..%2F..%2F..%2Fsecret.png','..%2Fsecret/images/x.png',jid+'/images/x.txt'):
+                with self.assertRaises(urllib.error.HTTPError) as e:urllib.request.urlopen(base+bad)
+                self.assertEqual(e.exception.code,404)
+
 if __name__=='__main__': unittest.main()
