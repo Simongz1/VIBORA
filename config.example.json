@@ -13,7 +13,8 @@
     "run_time": "00:30:00"
   },
   "max_repairs": 2,
-  "render_python": "python3",
+  "render_conda_env": "moose",
+  "render_conda_prefix": "",
   "ollama_url": "http://127.0.0.1:11434",
   "openai_compatible_url": "http://127.0.0.1:8000/v1",
   "toolchain_bin": [

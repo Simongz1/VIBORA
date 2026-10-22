@@ -191,6 +191,33 @@ def run_results(folder):
   if m.get('error'):result['images_error']=m['error']
   if m.get('deformed'):result['images_deformed']=True
  return result
+CONDA_BASES=('miniforge3','mambaforge','miniconda3','anaconda3')
+def conda_env_prefix(name):
+ # Folder of the named conda environment: explicit setting, the usual install folders, then conda's own list.
+ if CONFIG.get('render_conda_prefix'):return Path(CONFIG['render_conda_prefix']).expanduser()
+ bases=[Path.home()/b for b in CONDA_BASES]+[Path.home()/'.conda']+[p/b for p in list(MOOSE.parents)[:3] for b in CONDA_BASES]
+ for base in bases:
+  if (base/'envs'/name/'bin'/'python').exists():return base/'envs'/name
+ conda=os.environ.get('CONDA_EXE') or shutil.which('conda') or shutil.which('mamba')
+ if conda:
+  try:envs=json.loads(subprocess.run([conda,'env','list','--json'],text=True,capture_output=True,timeout=20).stdout).get('envs',[])
+  except (OSError,ValueError,subprocess.TimeoutExpired):envs=[]
+  for e in envs:
+   if Path(e).name==name and (Path(e)/'bin'/'python').exists():return Path(e)
+ return None
+def render_command():
+ # Result images run in the conda environment that has numpy, matplotlib and netCDF4 (default: moose).
+ script=shlex.quote(str(ROOT/'scripts'/'render_results.py'))+' . > render.log 2>&1'
+ if CONFIG.get('render_python'):return shlex.quote(CONFIG['render_python'])+' '+script
+ name=CONFIG.get('render_conda_env','moose');prefix=conda_env_prefix(name)
+ if prefix is None:
+  error={'error':'Conda environment "'+name+'" was not found for result images (looked in ~/'+', ~/'.join(CONDA_BASES)+', ~/.conda, next to '+str(MOOSE.parent)+
+   ' and in "conda env list"). Set render_conda_prefix in config.local.json to the environment folder, for example ~/miniforge3/envs/'+name+'.'}
+  return 'mkdir -p images && printf "%s\\n" '+shlex.quote(json.dumps(error))+' > images/manifest.json'
+ # Equivalent of "conda activate" for this command: the environment's tools first on PATH.
+ bin=prefix/'bin'
+ return ('env PATH='+shlex.quote(str(bin))+':"$PATH" CONDA_PREFIX='+shlex.quote(str(prefix))+' CONDA_DEFAULT_ENV='+shlex.quote(name)+' '
+         +shlex.quote(str(bin/'python'))+' '+script)
 def seconds(wall):
  h,m,s=(int(x) for x in wall.split(':'));return h*3600+m*60+s
 def run_submit(jid,text,ranks,wall,where='slurm'):
@@ -215,7 +242,7 @@ def run_submit(jid,text,ranks,wall,where='slurm'):
   +'export OMP_NUM_THREADS=1\nhostname > node\n')
  moose='mpiexec -n '+str(ranks)+' '+shlex.quote(str(executable()))+' -i model.i Outputs/csv=true Outputs/exodus=true > moose.log 2>&1'
  # Result images come from the Exodus output; a rendering problem never changes the run's exit code.
- render=shlex.quote(CONFIG.get('render_python','python3'))+' '+shlex.quote(str(ROOT/'scripts'/'render_results.py'))+' . > render.log 2>&1'
+ render=render_command()
  if where=='login':
   # Status checks may reach a different login node, so all state lives in files on the shared filesystem:
   # a heartbeat while running, a cancel flag the loop obeys, and the exit code at the end.

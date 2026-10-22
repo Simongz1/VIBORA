@@ -104,7 +104,8 @@ def main():
         manifest = render(folder)
     except ImportError as e:
         manifest = {'error': 'Result images need numpy and matplotlib, plus netCDF4 or h5py, in the Python that runs them (%s): %s. '
-                    'Install with "python3 -m pip install --user numpy matplotlib netCDF4", or set render_python in config.local.json.' % (sys.executable, e)}
+                    'Install them into the conda environment named by render_conda_env (default moose), or point render_conda_prefix '
+                    'in config.local.json at an environment that has them.' % (sys.executable, e)}
     except Exception as e:
         manifest = {'error': 'Could not create result images: %s: %s' % (type(e).__name__, e)}
     (folder / 'images').mkdir(exist_ok=True)

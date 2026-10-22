@@ -1,4 +1,4 @@
-import copy,importlib.util,json,tempfile,time,types,unittest
+import copy,importlib.util,json,os,subprocess,tempfile,time,types,unittest
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 def load(name,path):
@@ -347,6 +347,7 @@ class WorkspaceTests(unittest.TestCase):
   workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'[Mesh]\n[]'})
   original=workspace.run;workspace.run=lambda args,**kw:{'returncode':0,'stdout':'5\n','stderr':''}
   self.addCleanup(setattr,workspace,'run',original)
+  self.conda_config(render_conda_prefix=str(workspace.ROOT/'envs/moose'))
   workspace.run_submit(self.jid,'[Mesh]\n[]',2,'')
   script=(workspace.jobdir(self.jid)/'run/run.sbatch').read_text()
   self.assertIn('Outputs/exodus=true',script);self.assertIn('render_results.py',script)
@@ -360,6 +361,44 @@ class WorkspaceTests(unittest.TestCase):
   self.assertNotIn('images',[f['name'] for f in status['outputs']])
   workspace.save(folder/'images/manifest.json',{'error':'Result images need numpy'})
   self.assertEqual(workspace.run_status(self.jid)['images_error'],'Result images need numpy')
+
+ def conda_config(self,**settings):
+  old=dict(workspace.CONFIG);self.addCleanup(lambda:(workspace.CONFIG.clear(),workspace.CONFIG.update(old)))
+  for k in ('render_python','render_conda_prefix','render_conda_env'):workspace.CONFIG.pop(k,None)
+  workspace.CONFIG.update(settings)
+ def fake_home(self):
+  home=workspace.ROOT/'home';home.mkdir(exist_ok=True)
+  environ=dict(os.environ);self.addCleanup(lambda:(os.environ.clear(),os.environ.update(environ)))
+  os.environ['HOME']=str(home);os.environ.pop('CONDA_EXE',None)
+  which=workspace.shutil.which;workspace.shutil.which=lambda name:None;self.addCleanup(setattr,workspace.shutil,'which',which)
+  return home
+ def fake_env(self,prefix):
+  # A python that records the environment it was started with instead of rendering.
+  (prefix/'bin').mkdir(parents=True);python=prefix/'bin'/'python'
+  python.write_text('#!/bin/bash\necho "$CONDA_PREFIX|$CONDA_DEFAULT_ENV|${PATH%%:*}|$1" > ran_in\n');python.chmod(0o755)
+  return prefix
+ def run_render_command(self):
+  folder=workspace.ROOT/'run';folder.mkdir(exist_ok=True)
+  subprocess.run(['bash','-c',workspace.render_command()],cwd=folder,check=True)
+  return folder
+ def test_images_render_inside_moose_conda_env(self):
+  home=self.fake_home();prefix=self.fake_env(home/'miniforge3/envs/moose');self.conda_config()
+  folder=self.run_render_command()
+  self.assertEqual((folder/'ran_in').read_text().strip(),str(prefix)+'|moose|'+str(prefix/'bin')+'|'+str(workspace.ROOT/'scripts/render_results.py'))
+ def test_conda_env_found_through_conda_env_list(self):
+  home=self.fake_home();prefix=self.fake_env(workspace.ROOT/'elsewhere/envs/moose');self.conda_config()
+  conda=home/'conda';conda.write_text('#!/bin/bash\necho \'{"envs": ["/opt/base", "'+str(prefix)+'"]}\'\n');conda.chmod(0o755)
+  os.environ['CONDA_EXE']=str(conda)
+  self.assertEqual(workspace.conda_env_prefix('moose'),prefix)
+ def test_explicit_prefix_and_interpreter_override(self):
+  self.fake_home();prefix=self.fake_env(workspace.ROOT/'custom/moose');self.conda_config(render_conda_prefix=str(prefix))
+  self.assertIn(str(prefix/'bin'/'python'),workspace.render_command())
+  self.conda_config(render_python='/usr/bin/python3');self.assertTrue(workspace.render_command().startswith('/usr/bin/python3 '))
+ def test_missing_conda_env_is_explained_in_gallery(self):
+  self.fake_home();self.conda_config(render_conda_env='moose')
+  folder=self.run_render_command()
+  error=json.loads((folder/'images/manifest.json').read_text())['error']
+  self.assertIn('"moose" was not found',error);self.assertIn('render_conda_prefix',error)
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())
