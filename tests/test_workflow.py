@@ -224,6 +224,9 @@ class ModelSummaryTests(unittest.TestCase):
   self.assertEqual(summary['resolution'],'4 × 5 × 2 = 40 HEX8 elements');self.assertTrue(summary['mesh_size'].startswith('0.002 × 1 × 1'))
   self.assertEqual(summary['constitutive_model'],['No material blocks in the input'])
   self.assertEqual(engine.summarize_input('[Mesh]\n file = part.e\n[]')['resolution'],'From mesh file part.e')
+ def test_older_block_syntax_is_read(self):
+  summary=engine.summarize_input('[Mesh]\n  [./gen]\n    type = GeneratedMeshGenerator\n    dim = 2\n    nx = 3\n    ny = 3\n  [../]\n[]\n[Materials]\n  [./k]\n    type = GenericConstantMaterial\n    prop_names = conductivity\n    prop_values = 5\n  [../]\n[]')
+  self.assertEqual(summary['resolution'],'3 × 3 = 9 QUAD4 elements');self.assertEqual(summary['constitutive_model'],['GenericConstantMaterial (conductivity = 5)'])
  def test_public_job_includes_summary_only_with_input(self):
   e=FakeEngine();self.assertNotIn('model_summary',e.public({'id':'x'}))
   self.assertIn('resolution',e.public({'id':'x','input':'[Mesh]\n dim = 1\n nx = 8\n[]'})['model_summary'])
@@ -591,6 +594,24 @@ class WorkspaceTests(unittest.TestCase):
   self.addCleanup(setattr,workspace,'run',original)
   workspace.run_submit(self.jid,'[Mesh]\n[]',2,'')
   self.assertEqual(json.loads((workspace.jobdir(self.jid)/'run/visualize.json').read_text()),{'names':['cauchy_stress_xx','temperature']})
+ def test_output_overrides_only_for_missing_outputs(self):
+  sub_block='[Outputs]\n  [exodus]\n    type = Exodus\n    time_step_interval = 2\n  []\n[]'
+  self.assertEqual(workspace.output_overrides(sub_block),['Outputs/csv=true'])
+  typed='[Outputs]\n  [./out]\n    type = CSV # postprocessors\n  [../]\n  [field]\n    type = Exodus\n  []\n[]'
+  self.assertEqual(workspace.output_overrides(typed),[])
+  path_syntax='[Outputs/csv]\n  type = CSV\n[]\n[Outputs]\n  exodus = true\n[]'
+  self.assertEqual(workspace.output_overrides(path_syntax),[])
+  self.assertEqual(workspace.output_overrides('[Outputs]\n  exodus = false\n  csv = true\n[]'),['Outputs/exodus=true'])
+  self.assertEqual(workspace.output_overrides('[Mesh]\n  [exodus]\n  []\n[]'),['Outputs/csv=true','Outputs/exodus=true'])
+  self.assertEqual(workspace.output_overrides(sub_block,('csv',)),['Outputs/csv=true'])
+ def test_run_script_skips_exodus_switch_when_input_has_exodus_block(self):
+  text='[Mesh]\n[]\n[Outputs]\n  [exodus]\n    type = Exodus\n  []\n[]'
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':text})
+  original=workspace.run;workspace.run=lambda args,**kw:{'returncode':0,'stdout':'5\n','stderr':''}
+  self.addCleanup(setattr,workspace,'run',original)
+  workspace.run_submit(self.jid,text,2,'')
+  script=(workspace.jobdir(self.jid)/'run/run.sbatch').read_text()
+  self.assertIn('-i model.i Outputs/csv=true > moose.log',script);self.assertNotIn('Outputs/exodus',script)
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())

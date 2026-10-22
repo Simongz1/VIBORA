@@ -143,14 +143,42 @@ def stage(jid,package):
  save(folder/'baseline.json',{'digest':app_digest()})
  (folder/'model.i').write_text(package['input'])
  return {'staged':True,'files':[f['path'] for f in files],'tests':[t['name'] for t in tests]}
+def written_outputs(text):
+ # Output kinds an input already writes: an exodus/csv switch in [Outputs], or a sub-block named or typed Exodus/CSV.
+ kinds=set();path=[];pushed=[]
+ for raw in str(text or '').splitlines():
+  line=raw.split('#',1)[0].strip()
+  if not line:continue
+  m=re.fullmatch(r'\[\s*(?:\./)?([^\]\s]*)\s*\]',line)
+  if m:
+   name=m.group(1).rstrip('/')   # [] and the older [../] both close a block
+   if name in ('','..'):
+    if pushed:del path[len(path)-pushed.pop():]
+   else:
+    parts=[x for x in name.split('/') if x];path+=parts;pushed.append(len(parts))
+    if len(path)==2 and path[0]=='Outputs' and path[1].lower() in ('exodus','csv'):kinds.add(path[1].lower())
+   continue
+  m=re.match(r'(\w+)\s*=\s*(.*)',line)
+  if not m or path[:1]!=['Outputs']:continue
+  key,value=m.group(1),m.group(2).strip().strip('\'"').lower()
+  if len(path)==1 and key in ('exodus','csv') and value in ('true','1','yes','on'):kinds.add(key)
+  if len(path)==2 and key=='type' and value in ('exodus','csv'):kinds.add(value)
+ return kinds
+def output_overrides(text,wanted=('csv','exodus')):
+ # Command-line switches only for outputs the input lacks: Outputs/exodus=true next to an [exodus] sub-block
+ # makes MOOSE stop with "unused parameter 'Outputs/exodus'".
+ have=written_outputs(text)
+ return ['Outputs/'+k+'=true' for k in wanted if k not in have]
 def run_tests(exe,folder,tests,env=None):
  outcomes=[]
  for t in tests:
   p=folder/t['name'];p.mkdir(parents=True,exist_ok=True);inp=p/'test.i';inp.write_text(t['input'])
-  r=run(['mpiexec','-n','1',exe,'-i',inp,'Outputs/csv=true','Outputs/file_base=result'],cwd=p,timeout=120,env=env)
+  r=run(['mpiexec','-n','1',exe,'-i',inp]+output_overrides(t['input'],('csv',))+['Outputs/file_base=result'],cwd=p,timeout=120,env=env)
   checks=[]
   if r['returncode']==0:
+   # A named [csv] sub-block writes result_<name>.csv instead of result.csv.
    csvpath=p/'result.csv'
+   if not csvpath.exists():csvpath=next(iter(sorted(p.glob('result*.csv'))),csvpath)
    if not csvpath.exists():r['returncode']=1;r['stderr']+='\nExpected result.csv was not produced.'
    else:
     with csvpath.open() as f:rows=list(csv.DictReader(f))
@@ -275,7 +303,7 @@ def run_submit(jid,text,ranks,wall,where='slurm'):
  head=('#!/bin/bash\nset -uo pipefail\ncd '+shlex.quote(str(folder))+'\n'
   +('export PATH='+shlex.quote(toolchain)+':"$PATH"\n' if toolchain else '')
   +'export OMP_NUM_THREADS=1\nhostname > node\n')
- moose='mpiexec -n '+str(ranks)+' '+shlex.quote(str(executable()))+' -i model.i Outputs/csv=true Outputs/exodus=true > moose.log 2>&1'
+ moose=' '.join(['mpiexec','-n',str(ranks),shlex.quote(str(executable())),'-i','model.i']+output_overrides(text))+' > moose.log 2>&1'
  # Result images come from the Exodus output; a rendering problem never changes the run's exit code.
  render=render_command()
  if where=='login':

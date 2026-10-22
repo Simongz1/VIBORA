@@ -125,8 +125,9 @@ def hit_blocks(text):
   if not line:continue
   m=re.fullmatch(r'\[\s*(?:\./)?([^\]\s]*)\s*\]',line)
   if m:
-   if m.group(1) in ('','..'):path=path[:-1]
-   else:path=path+[m.group(1)];blocks.setdefault('/'.join(path),{})
+   name=m.group(1).rstrip('/')   # [] and the older [../] both close a block
+   if name in ('','..'):path=path[:-1]
+   else:path=path+[name];blocks.setdefault('/'.join(path),{})
    continue
   m=re.match(r'([A-Za-z_][\w:/.-]*)\s*=\s*(.*)',line)
   if m and path:blocks['/'.join(path)][m.group(1)]=m.group(2).strip().strip('\'"').strip()
