@@ -62,6 +62,45 @@ def describe(answer):
  if answer.get('summary'):parts.append(str(answer['summary'])[:300])
  return ' '.join(parts)
 
+# Parameters every MOOSE object carries that rarely matter when writing an input; left out of prompts.
+BOILERPLATE={'control_tags','enable','implicit','seed','allow_duplicate_execution_on_initial','force_preaux','force_preic',
+ 'force_postaux','prop_getter_suffix','use_interpolated_state','absolute_value_vector_tags','extra_matrix_tags',
+ 'extra_vector_tags','matrix_tags','vector_tags','diag_save_in','save_in','search_method','ghost_layers'}
+def brief_objects(details,names=None):
+ # Parameter documentation without C++ source, boilerplate parameters or long descriptions.
+ wanted={str(n).rsplit('/',1)[-1] for n in names} if names else None
+ brief=[]
+ for d in details or []:
+  if wanted is not None and d['path'].rsplit('/',1)[-1] not in wanted:continue
+  params={k:{a:(v[:200] if a=='description' and isinstance(v,str) else v) for a,v in (p or {}).items()}
+          for k,p in d.get('parameters',{}).items() if k not in BOILERPLATE}
+  brief.append({'path':d['path'],'description':str(d.get('description',''))[:400],'parameters':params})
+ return brief if brief or wanted is None else brief_objects(details)
+def brief_capabilities(capabilities):
+ return [{k:c[k] for k in ('id','summary','objects') if k in c} for c in capabilities or []]
+def diagnostics(check):
+ # MOOSE output reduced to the lines that explain a failure, plus the end of the log.
+ text=str(check.get('stdout',''))+'\n'+str(check.get('stderr',''))
+ lines=[l.strip() for l in text.splitlines() if re.search(r'error|invalid|unknown|missing|not found|required|unused',l,re.I)]
+ return {'valid':check.get('valid'),'returncode':check.get('returncode'),'error_lines':lines[:40],'log_tail':text[-3000:]}
+def build_failure(result):
+ # Build/test result with long logs cut to their ends.
+ cut=lambda r:{k:(v[-4000:] if isinstance(v,str) else v) for k,v in (r or {}).items()}
+ out={k:v for k,v in (result or {}).items() if k not in ('build','validation','tests')}
+ if result.get('build'):out['build']=cut(result['build'])
+ if result.get('validation'):out['validation']=cut(result['validation'])
+ out['tests']=[dict(t,log=cut(t.get('log'))) for t in result.get('tests') or []]
+ return out
+
+def tokens(n):return ('%.1fk'%(n/1000)) if n>=1000 else str(n)
+def usage_text(u):
+ # Token counts as reported by the provider; Codex only reports a combined total.
+ if not u:return ' (token usage not reported)'
+ if 'input' in u or 'output' in u:
+  return (' ('+tokens(u.get('input',0))+' input tokens'+(', '+tokens(u['cached'])+' from cache' if u.get('cached') else '')
+          +', '+tokens(u.get('output',0))+' output)')
+ return ' ('+tokens(u.get('total',0))+' tokens)'
+
 def hit_blocks(text):
  # Minimal MOOSE input (HIT) reader for summaries: {'Materials/stress': {'type': ...}}. Not a validator.
  blocks={};path=[]
@@ -128,6 +167,11 @@ def claude_client():
   raise RuntimeError('Set ANTHROPIC_API_KEY before starting the bridge')
  return anthropic,client
 def digest(value):return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()
+def semantic_hash(g):
+ # Same model wherever blocks sit on the canvas; must match semantic_hash in moose_workspace.py.
+ nodes=sorted(({k:v for k,v in n.items() if k not in ('x','y')} for n in g.get('nodes',[])),key=lambda n:str(n.get('id')))
+ edges=sorted(g.get('edges',[]),key=lambda e:json.dumps(e,sort_keys=True))
+ return digest({'request':g.get('request',''),'nodes':nodes,'edges':edges})
 def graph_errors(g):
  errors=[]
  if not isinstance(g,dict) or not isinstance(g.get('nodes'),list) or not isinstance(g.get('edges'),list):return ['Graph needs nodes and edges arrays.']
@@ -165,6 +209,8 @@ def graph_evidence(g):
 class Engine:
  def __init__(self,args):
   self.args=args;self.jobs={};self.lock=threading.RLock();self.active=set()
+  # Token counts reported by the provider for the current thread's last model call.
+  self.usage=threading.local()
   self.host=args.ssh_host or os.environ.get('VIBORA_SSH_HOST','gonz1075@gilbreth.rcac.purdue.edu')
   self.remote=args.remote_dir
  def rpc(self,payload,timeout=220):
@@ -225,6 +271,8 @@ class Engine:
     cmd+=['-']
     p=subprocess.run(cmd,input=prompt,text=True,capture_output=True,timeout=300)
     if p.returncode:raise RuntimeError('Selected Codex model failed: '+p.stderr[-1200:])
+    used=re.findall(r'tokens used\D{0,5}([\d,]+)',p.stderr+p.stdout)
+    if used:self.record_usage(total=used[-1].replace(',',''))
     return json.loads((root/'answer.json').read_text())
   if provider=='anthropic':return self.claude(mid,prompt,schema)
   if provider=='claude-code':
@@ -239,6 +287,9 @@ class Engine:
    try:out=json.loads(p.stdout)
    except ValueError:raise RuntimeError('Selected Claude Code model failed: '+(p.stderr or p.stdout)[-1200:])
    if p.returncode or out.get('is_error'):raise RuntimeError('Selected Claude Code model failed: '+str(out.get('result') or p.stderr)[-1200:])
+   u=out.get('usage') or {}
+   self.record_usage(input=sum(u.get(k) or 0 for k in ('input_tokens','cache_creation_input_tokens','cache_read_input_tokens')),
+                     cached=u.get('cache_read_input_tokens'),output=u.get('output_tokens'))
    answer=out.get('structured_output')
    return answer if isinstance(answer,dict) else json.loads(out['result'])
   if provider not in ('ollama','local'):raise ValueError('Unknown model provider')
@@ -247,6 +298,8 @@ class Engine:
   if provider=='ollama':body.update(format=schema,options={'temperature':0});endpoint='/api/chat'
   else:body.update(temperature=0,response_format={'type':'json_schema','json_schema':{'name':'vibora','strict':True,'schema':schema}});endpoint='/chat/completions'
   with urlopen(Request(url+endpoint,data=json.dumps(body).encode(),headers={'Content-Type':'application/json'}),timeout=300) as r:data=json.load(r)
+  if provider=='ollama':self.record_usage(input=data.get('prompt_eval_count'),output=data.get('eval_count'))
+  else:self.record_usage(input=(data.get('usage') or {}).get('prompt_tokens'),output=(data.get('usage') or {}).get('completion_tokens'))
   return json.loads(data['message']['content'] if provider=='ollama' else data['choices'][0]['message']['content'])
  def claude(self,mid,prompt,schema):
   anthropic,client=claude_client()
@@ -266,7 +319,13 @@ class Engine:
    detail=getattr(message.stop_details,'explanation',None)
    raise RuntimeError('Claude declined this request'+(': '+detail if detail else '.'))
   if message.stop_reason=='max_tokens':raise RuntimeError('Claude response exceeded the output limit before completing the JSON.')
+  u=getattr(message,'usage',None)
+  if u is not None:
+   cached=getattr(u,'cache_read_input_tokens',0) or 0
+   self.record_usage(input=(getattr(u,'input_tokens',0) or 0)+cached+(getattr(u,'cache_creation_input_tokens',0) or 0),cached=cached,output=getattr(u,'output_tokens',None))
   return json.loads(next(b.text for b in message.content if b.type=='text'))
+ def record_usage(self,**counts):
+  self.usage.value={k:int(v) for k,v in counts.items() if v not in (None,'')}
  def log(self,j,message):
   # Kept in memory for live polling and saved with the next state update.
   with self.lock:
@@ -275,11 +334,17 @@ class Engine:
  def ask(self,j,purpose,prompt,schema):
   model=j.get('model') or {}
   self.log(j,'Asking '+str(model.get('provider','?'))+' / '+str(model.get('id','?'))+' to '+purpose+' ('+str(max(1,len(prompt)//1000))+' kB prompt).')
-  started=time.time()
+  started=time.time();self.usage.value=None
   try:answer=self.llm(model,prompt,schema)
   except Exception as e:
    self.log(j,'Model call failed after '+str(round(time.time()-started))+' s: '+str(e)[:300]);raise
-  self.log(j,'Model answered in '+str(round(time.time()-started))+' s. '+describe(answer))
+  used=getattr(self.usage,'value',None) or {}
+  with self.lock:
+   total=j.setdefault('usage',{'calls':0,'input':0,'cached':0,'output':0,'total':0,'unreported':0})
+   total['calls']+=1
+   for k in ('input','cached','output','total'):total[k]+=used.get(k,0)
+   if not used:total['unreported']+=1
+  self.log(j,'Model answered in '+str(round(time.time()-started))+' s'+usage_text(used)+'. '+describe(answer))
   return answer
  def model_list(self,refresh=False):
   # Cached so starting a job never waits on provider discovery; Refresh models forces a new check.
@@ -296,6 +361,8 @@ class Engine:
   with self.lock:
    if values.get('summary') and values['summary']!=j.get('summary'):self.log(j,values['summary'])
    if values.get('error'):self.log(j,'Error: '+str(values['error'])[:400])
+   if values.get('status')!=j.get('status') and values.get('status') in ('ready','failed','needs_clarification','awaiting_approval') and (j.get('usage') or {}).get('calls'):
+    u=j['usage'];self.log(j,'Model usage so far: '+str(u['calls'])+' call(s)'+usage_text({k:u[k] for k in ('input','cached','output') if u[k]} or ({'total':u['total']} if u['total'] else {}))+'.')
    j.update(values);j['updated_at']=time.time()
   self.persist(j)
  def start(self,request):
@@ -305,7 +372,8 @@ class Engine:
   listed=lambda models:any(m['provider']==model.get('provider') and m['id']==model.get('id') for m in models['models'])
   if not listed(self.model_list()) and not listed(self.model_list(refresh=True)):raise ValueError('Select a model advertised by the connected provider.')
   jid=uuid.uuid4().hex
-  j={'id':jid,'status':'discovering','graph':g,'graph_hash':digest(g),'model':model,'summary':'Inspecting available MOOSE objects.','created_at':time.time()}
+  j={'id':jid,'status':'discovering','graph':g,'graph_hash':digest(g),'semantic_hash':semantic_hash(g),'force':bool(request.get('force')),
+     'model':model,'summary':'Inspecting available MOOSE objects.','created_at':time.time()}
   with self.lock:self.jobs[jid]=j
   self.log(j,'Job created for '+str(model.get('provider'))+' / '+str(model.get('id'))+' with '+str(len(g.get('nodes',[])))+' blocks and '+str(len(g.get('edges',[])))+' connections.')
   # Saving on Gilbreth happens in the job thread so the GUI gets the job, and its log, immediately.
@@ -323,28 +391,53 @@ class Engine:
   threading.Thread(target=work,daemon=True).start()
  def plan(self,j):
   self.persist(j)
+  if not j.get('force') and self.reuse(j):return
   self.log(j,'Loading the MOOSE/MARLINS object catalog and retained capabilities from Gilbreth.')
   context=self.rpc({'op':'context','graph':j['graph']})
   self.log(j,'Catalog loaded: '+str(len(context.get('object_paths',[])))+' registered objects, '+str(len(context.get('capabilities',[])))+' retained VIBORA capabilities.')
   evidence=graph_evidence(j['graph']);j['evidence']=evidence
-  discovery=self.ask(j,'choose the MOOSE objects whose parameters it needs',INSTRUCTIONS+'\nSelect up to 30 object/action names from this catalog whose parameter definitions are needed. Return questions only for genuinely missing model data.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'catalog':context}),DISCOVERY)
+  # The catalog holds the most relevant objects only; any other registered object may still be named exactly.
+  catalog={'relevant_objects':context.get('relevant_objects',[]),'retained_capabilities':brief_capabilities(context.get('capabilities')),
+           'application':context.get('application'),'custom_application':context.get('custom_application')}
+  discovery=self.ask(j,'choose the MOOSE objects whose parameters it needs',INSTRUCTIONS+'\nSelect up to 30 object/action names whose parameter definitions are needed. '
+   'relevant_objects lists the best keyword matches; you may also name any other registered MOOSE object by its exact type name. '
+   'Return questions only for genuinely missing model data.\n'+json.dumps({'resolved_graph_evidence':evidence,'catalog':catalog}),DISCOVERY)
   details=self.rpc({'op':'details','paths':discovery['objects']})
-  self.log(j,'Loaded parameter documentation and source for '+str(len(details))+' objects: '+', '.join(d['path'].rsplit('/',1)[-1] for d in details[:15])+('…' if len(details)>15 else '')+'.')
+  self.log(j,'Loaded parameter documentation for '+str(len(details))+' objects: '+', '.join(d['path'].rsplit('/',1)[-1] for d in details[:15])+('…' if len(details)>15 else '')+'.')
   self.update(j,status='planning',summary='Designing the MOOSE input from registered object definitions.')
-  prompt=INSTRUCTIONS+'\nReturn a complete MOOSE input if feasible with existing objects. Otherwise return needs_custom with a concrete proposal, or needs_clarification with questions. No C++ files yet.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'objects':details,'retained_capabilities':context['capabilities'],'discovery_questions':discovery['questions']})
+  # Source code and full catalog stay in j['context'] for approved custom coding; planning gets brief documentation.
+  j['context']={'objects':details,'retained_capabilities':context['capabilities'],'brief_objects':brief_objects(details)}
+  prompt=INSTRUCTIONS+'\nReturn a complete MOOSE input if feasible with existing objects. Otherwise return needs_custom with a concrete proposal, or needs_clarification with questions. No C++ files yet.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'objects':j['context']['brief_objects'],'retained_capabilities':brief_capabilities(context['capabilities']),'discovery_questions':discovery['questions']})
   plan=self.ask(j,'design the MOOSE input',prompt,PLAN)
-  j['context']={'objects':details,'retained_capabilities':context['capabilities']}
   self.finish_plan(j,plan,prompt)
+ def reuse(self,j):
+  # An unchanged graph reuses the newest ready job's input: one MOOSE check, no model calls.
+  try:found=self.rpc({'op':'find_ready','semantic_hash':j['semantic_hash'],'exclude':j['id']})
+  except Exception as e:
+   self.log(j,'Could not look for an earlier result to reuse ('+str(e)[:200]+'); generating a new input.');return False
+  if not found or not found.get('input'):return False
+  source=found.get('model') or {}
+  self.log(j,'The graph and requirements are unchanged since job '+found['id'][:8]+' (made with '+str(source.get('provider'))+' / '+str(source.get('id'))+'). Reusing its validated input instead of calling the model.')
+  self.update(j,status='checking',summary='Re-checking the reused input with the installed MOOSE application.')
+  check=self.rpc({'op':'check','id':j['id'],'input':found['input']})
+  if not check.get('valid'):
+   self.log(j,'The reused input no longer passes --check-input; generating a new one.');return False
+  self.update(j,status='ready',summary=found.get('summary') or 'Reused validated input.',input=found['input'],plan=found.get('plan'),validation=check,
+              reused_from=found['id'],retained=found.get('retained'),verification='Reused from job '+found['id'][:8]+'; MOOSE --check-input passed again; no model calls and no full simulation were run.')
+  return True
  def review_questions(self,j,plan,prompt):
   if plan['status']!='needs_clarification' and not plan['questions']:return plan
   self.update(j,status='planning',summary='Checking proposed questions against existing graph settings and connections.')
-  return self.ask(j,'check '+str(len(plan['questions']))+' proposed question(s) against the graph',prompt+"\nReview the provisional plan below before asking the user anything. "
+  return self.ask(j,'check '+str(len(plan['questions']))+' proposed question(s) against the graph',INSTRUCTIONS+"\nReview the provisional plan below before asking the user anything. "
    "Answer every proposed question from the graph evidence wherever possible. In particular mesh params "
    "specify dimensions/resolution, variable blocks specify names, edges specify couplings and IC targets. "
    "Use model-level requirements to resolve overrides. Remove already-answered questions; regenerate "
    "the complete input if nothing is missing. Keep genuinely absent physical data as targeted questions, "
    "not a general setup questionnaire. Do not invent constants to avoid asking.\n"+
-   json.dumps({'provisional_plan':plan,'resolved_graph_evidence':graph_evidence(j['graph'])}),PLAN)
+   json.dumps({'provisional_plan':plan,'resolved_graph_evidence':graph_evidence(j['graph']),'objects':self.plan_objects(j,plan)}),PLAN)
+ def plan_objects(self,j,plan):
+  # Documentation only for the objects the plan uses; repairs and reviews never resend the whole planning prompt.
+  return brief_objects((j.get('context') or {}).get('objects'),plan.get('objects'))
  def finish_plan(self,j,plan,prompt):
   plan=self.review_questions(j,plan,prompt)
   if plan['status']=='needs_clarification' or plan['questions']:
@@ -360,7 +453,8 @@ class Engine:
    if check['valid']:
     self.update(j,status='ready',summary=plan['summary'],input=plan['input'],plan=plan,validation=check,verification='MOOSE --check-input passed; no full simulation was run.');return
    if attempt<2:
-    plan=self.ask(j,'repair the input using the MOOSE diagnostics',prompt+'\nThe input failed MOOSE validation. Repair syntax/parameters; do not simplify the physics.\n'+json.dumps({'previous':plan,'diagnostics':check}),PLAN)
+    plan=self.ask(j,'repair the input using the MOOSE diagnostics',INSTRUCTIONS+'\nThe previous MOOSE input failed validation. Return the complete repaired input; fix syntax and parameters without simplifying the physics.\n'
+     +json.dumps({'resolved_graph_evidence':graph_evidence(j['graph']),'objects':self.plan_objects(j,plan),'previous':plan,'diagnostics':diagnostics(check)}),PLAN)
     if plan['status']!='builtin' or plan['questions']:
      plan=self.review_questions(j,plan,prompt)
     if plan['status']!='builtin' or plan['questions']:
@@ -404,7 +498,7 @@ Include at least one small deterministic numerical test with a known analytical 
 each test input must produce scalar postprocessor columns in CSV, and checks specify
 the FINAL-row expected column value and absolute tolerance. Exit status alone is not
 a sufficient test. Tests run serially with a 120-second limit each.
-""" + json.dumps({'graph':j['graph'],'approved_plan':j['plan'],'context':j.get('context',{})})
+""" + json.dumps({'graph':j['graph'],'approved_plan':j['plan'],'context':{k:v for k,v in (j.get('context') or {}).items() if k!='brief_objects'}})
   package=self.ask(j,'write the custom C++ implementation and numerical tests',prompt,PACKAGE)
   j['package']=package;j['coding_prompt']=prompt;j['repair_count']=0
   self.submit_package(j)
@@ -429,7 +523,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
      return
     if j.get('repair_count',0)<2:
      self.update(j,status='coding',summary='Build or test failed. Repairing the approved implementation.',test_result=result)
-     j['package']=self.ask(j,'repair the implementation after the failed build or tests',j['coding_prompt']+'\nRepair the implementation without weakening tests or changing requested physics.\n'+json.dumps({'previous':j['package'],'failure':result}),PACKAGE)
+     j['package']=self.ask(j,'repair the implementation after the failed build or tests',j['coding_prompt']+'\nRepair the implementation without weakening tests or changing requested physics.\n'+json.dumps({'previous':j['package'],'failure':build_failure(result)}),PACKAGE)
      j['repair_count']=j.get('repair_count',0)+1
      self.rpc({'op':'stage','id':j['id'],'package':j['package']})
      queued=self.rpc({'op':'submit','id':j['id']})

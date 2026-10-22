@@ -39,6 +39,25 @@ def pick_times(count):
     if count <= MAX_TIMES: return list(range(count))
     return sorted({round(i * (count - 1) / (MAX_TIMES - 1)) for i in range(MAX_TIMES)})
 
+def uniform_frame(plt, Triangulation, np, out, name, value, coords, values, triangles, times, steps, displaced, dim):
+    first, last = steps[0], steps[-1]
+    span = 't = %g' % times[first] if first == last else 't = %g to %g' % (times[first], times[last])
+    fig, ax = plt.subplots(figsize=(6.4, 5.0), dpi=100)
+    if dim == 2:
+        x, y = coords[0], coords[1]
+        if displaced: x, y = x + values['disp_x'][last], y + values['disp_y'][last]
+        ax.tripcolor(Triangulation(x, y, triangles), np.zeros(len(x)), cmap='Greys', vmin=-1, vmax=4)
+        ax.set_aspect('equal')
+    else:
+        ax.axhline(value, color='#16775c'); ax.set_ylabel(name); ax.ticklabel_format(axis='y', useOffset=False)
+    ax.text(0.5, 0.5, '%s = %g\neverywhere' % (name, value), transform=ax.transAxes, ha='center', va='center', fontsize=15,
+            bbox=dict(boxstyle='round', facecolor='white', edgecolor='#16775c'))
+    ax.set_title('%s is uniform and unchanged (%s)' % (name, span))
+    fig.tight_layout()
+    file = '%s_uniform.png' % re.sub(r'[^A-Za-z0-9_.-]', '_', name)
+    fig.savefig(out / file); plt.close(fig)
+    return {'variable': name, 'time': float(times[first]), 'time_end': float(times[last]), 'step': first, 'file': file, 'uniform': value}
+
 def render(folder):
     import numpy as np
     import matplotlib
@@ -78,7 +97,10 @@ def render(folder):
     for name in shown:
         data = values[name][steps]
         low, high = float(np.nanmin(data)), float(np.nanmax(data))
-        if high <= low: high = low + (abs(low) or 1) * 1e-9
+        if high - low <= 1e-12 * max(1.0, abs(low), abs(high)):
+            # A field that never changes gets one labelled frame instead of a meaningless colour scale.
+            images.append(uniform_frame(plt, Triangulation, np, out, name, low, coords, values, triangles, times, steps, displaced, dim))
+            continue
         for step in steps:
             fig, ax = plt.subplots(figsize=(6.4, 5.0), dpi=100)
             if dim == 2:
@@ -86,11 +108,12 @@ def render(folder):
                 if displaced: x, y = x + values['disp_x'][step], y + values['disp_y'][step]
                 mesh = Triangulation(x, y, triangles)
                 art = ax.tripcolor(mesh, values[name][step], shading='gouraud', cmap='viridis', vmin=low, vmax=high)
-                ax.set_aspect('equal'); fig.colorbar(art, ax=ax, shrink=0.85)
+                ax.set_aspect('equal'); bar = fig.colorbar(art, ax=ax, shrink=0.85)
+                bar.formatter.set_useOffset(False); bar.update_ticks()
             else:
                 order = np.argsort(coords[0])
                 ax.plot(coords[0][order], values[name][step][order], color='#16775c')
-                ax.set_ylim(low, high); ax.set_ylabel(name); ax.grid(alpha=0.3)
+                ax.set_ylim(low, high); ax.set_ylabel(name); ax.grid(alpha=0.3); ax.ticklabel_format(axis='y', useOffset=False)
             ax.set_title('%s   t = %g%s' % (name, times[step], '   (deformed)' if displaced else ''))
             fig.tight_layout()
             file = '%s_%03d.png' % (re.sub(r'[^A-Za-z0-9_.-]', '_', name), step)

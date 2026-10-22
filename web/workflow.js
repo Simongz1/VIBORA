@@ -35,6 +35,13 @@ $('#new-model').onclick=()=>{
  graph={version:2,title:'New MOOSE model',request:'',nodes:[node('component',100,100,'Model physics')],edges:[]};
  selected=graph.nodes[0].id;pending=null;render();inspect();invalidate();
 };
+const kTokens=n=>n>=1000?(n/1000).toFixed(1)+'k':String(n);
+function usageLabel(job){
+ if(job.reused_from&&!job.usage?.calls)return ' · reused job '+job.reused_from.slice(0,8)+', no model calls';
+ const u=job.usage;if(!u?.calls)return '';
+ const counted=u.input||u.output?kTokens(u.input)+' input'+(u.cached?' ('+kTokens(u.cached)+' cached)':'')+', '+kTokens(u.output)+' output tokens':u.total?kTokens(u.total)+' tokens':'tokens not reported';
+ return ' · '+u.calls+' model call'+(u.calls>1?'s':'')+', '+counted;
+}
 const RUN_ACTIVE=['submitting','queued','running'];
 function renderLog(entries,active){
  const list=$('#job-log'),follow=list.scrollTop+list.clientHeight>=list.scrollHeight-8;
@@ -96,14 +103,17 @@ function showImages(job,run){
   const url='/api/jobs/'+job.id+'/images/'+encodeURIComponent(i.file)+'?v='+stamp;
   const link=el('a');link.href=url;link.target='_blank';link.rel='noopener';
   const img=el('img');img.src=url;img.alt=i.variable+' at t = '+Number(i.time.toPrecision(6));img.loading='lazy';link.append(img);
-  const figure=el('figure');figure.append(link,el('figcaption','t = '+Number(i.time.toPrecision(6))));return figure;
+  const when=t=>Number(t.toPrecision(6));
+  const caption=i.uniform!==undefined?'Unchanged at '+when(i.uniform)+', t = '+when(i.time)+' to '+when(i.time_end):'t = '+when(i.time);
+  const figure=el('figure');figure.append(link,el('figcaption',caption));return figure;
  }));
 }
 $('#run-variable').onchange=()=>{galleryKey='';if(currentJob)showImages(currentJob,currentJob.run||{});};
 function showJob(job){
  currentJob=job;$('#job-status').hidden=false;
  $('#job-title').textContent=job.status.replaceAll('_',' ');
- $('#job-model').textContent=(job.model?.provider||'')+' / '+(job.model?.id||'');
+ $('#job-model').textContent=(job.model?.provider||'')+' / '+(job.model?.id||'')+usageLabel(job);
+ $('#regenerate').hidden=!(job.reused_from&&job.status==='ready');
  $('#job-summary').textContent=job.summary||job.error||'';
  $('#job-questions').replaceChildren();
  for(const q of job.questions||[])$('#job-questions').append(el('p',q,'issue'));
@@ -132,7 +142,7 @@ async function pollJob(){
  try{showJob(await api('jobs/status',{id:currentJob.id}));}
  catch(e){setBusy(false);$('#job-summary').textContent='Connection interrupted: '+e.message;status(e.message);}
 }
-$('#generate').onclick=async()=>{
+async function startJob(force){
  if(generationPending)return;
  clearTimeout(timer);generated='';resolvedGraph=null;setBusy(true);jobSnapshot=JSON.stringify(graph);
  $('#job-dialog').showModal();$('#job-title').textContent='Starting';$('#job-summary').textContent='Creating a MOOSE implementation job…';
@@ -140,10 +150,12 @@ $('#generate').onclick=async()=>{
  $('#job-questions').replaceChildren();$('#job-details').textContent='';$('#custom-approval').hidden=true;$('#view-generated').hidden=true;
  $('#job-log').replaceChildren();$('#run-panel').hidden=true;
  try{
-  const job=await api('jobs/start',{graph:clone(graph),model:selectedModel});clearInterval(tick);
+  const job=await api('jobs/start',{graph:clone(graph),model:selectedModel,force});clearInterval(tick);
   localStorage.setItem('vibora-job',JSON.stringify({id:job.id,snapshot:jobSnapshot}));showJob(job);
  }catch(e){clearInterval(tick);setBusy(false);$('#job-title').textContent='Could not start';$('#job-summary').textContent=e.message;status(e.message);}
-};
+}
+$('#generate').onclick=()=>startJob(false);
+$('#regenerate').onclick=()=>startJob(true);
 $('#approve-custom').onclick=async()=>{
  if(!currentJob||currentJob.status!=='awaiting_approval')return;
  if(jobSnapshot!==JSON.stringify(graph)){status('Graph changed. Generate a new proposal.');return;}

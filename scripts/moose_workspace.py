@@ -49,7 +49,7 @@ def context(request):
   m=json.loads(p.read_text())
   capabilities.append({k:m[k] for k in ('id','summary','objects','files')})
   capabilities[-1]['source']=[{'path':f,'content':(ROOT/'moose_app'/f).read_text()} for f in m['files']]
- return {'object_paths':list(entries),'relevant_objects':[{'path':e['path'],'description':e['description']} for e in ranked[:60]],
+ return {'object_paths':list(entries),'relevant_objects':[{'path':e['path'],'description':e['description'][:200]} for e in ranked[:150]],
          'capabilities':capabilities,'application':'MARLINS (mlApp), all registered MOOSE modules','custom_application':'ViboraPhysicsApp',
          'source_digest':app_digest()}
 def details(paths):
@@ -78,6 +78,21 @@ def check_input(jid,text):
  result=run([executable(),'-i',path,'--check-input'],cwd=folder,timeout=120)
  result['valid']=result['returncode']==0;result['executable']=str(executable());result['input_path']=str(path)
  save(folder/'validation.json',result);return result
+def semantic_hash(g):
+ # Must match semantic_hash in workflow_engine.py: canvas positions do not change the model.
+ nodes=sorted(({k:v for k,v in n.items() if k not in ('x','y')} for n in g.get('nodes',[])),key=lambda n:str(n.get('id')))
+ edges=sorted(g.get('edges',[]),key=lambda e:json.dumps(e,sort_keys=True))
+ return hashlib.sha256(json.dumps({'request':g.get('request',''),'nodes':nodes,'edges':edges},sort_keys=True).encode()).hexdigest()
+def find_ready(semantic,exclude=None):
+ # Newest ready job for the same model; older jobs without a stored hash are hashed from their graph.
+ best=None
+ for path in (STATE/'jobs').glob('*/state.json'):
+  try:state=json.loads(path.read_text())
+  except (OSError,ValueError):continue
+  if state.get('id')==exclude or state.get('status')!='ready' or not state.get('input'):continue
+  h=state.get('semantic_hash') or (semantic_hash(state['graph']) if isinstance(state.get('graph'),dict) else None)
+  if h==semantic and (best is None or state.get('updated_at',0)>best.get('updated_at',0)):best=state
+ return {k:best[k] for k in ('id','input','plan','summary','model','retained','updated_at') if k in best} if best else None
 def authorize(jid,plan_hash):
  path=jobdir(jid)/'state.json'
  data=json.loads(path.read_text())
@@ -329,6 +344,7 @@ def dispatch(r):
  if op=='save_job':save(jobdir(jid)/'state.json',r['state']);return {'saved':True}
  if op=='load_job':return json.loads((jobdir(jid)/'state.json').read_text())
  if op=='authorize':return authorize(jid,r['plan_hash'])
+ if op=='find_ready':return find_ready(r['semantic_hash'],r.get('exclude'))
  if op=='stage':return stage(jid,r['package'])
  if op=='submit':return submit(jid)
  if op=='build_status':return build_status(jid)

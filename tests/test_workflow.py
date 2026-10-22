@@ -125,6 +125,11 @@ class ClaudeCodeProviderTests(unittest.TestCase):
   cmd,kwargs=calls[0]
   self.assertEqual(json.loads(cmd[cmd.index('--json-schema')+1]),engine.DISCOVERY)
   self.assertEqual(cmd[cmd.index('--tools')+1],'');self.assertIn('--strict-mcp-config',cmd);self.assertEqual(kwargs['input'],'plan this')
+ def test_usage_read_from_cli_json(self):
+  e,calls=self.use(json.dumps({'is_error':False,'structured_output':{'objects':[],'questions':[]},
+   'usage':{'input_tokens':120,'cache_creation_input_tokens':30,'cache_read_input_tokens':5000,'output_tokens':80}}))
+  e.llm({'provider':'claude-code','id':'opus'},'p',engine.DISCOVERY)
+  self.assertEqual(e.usage.value,{'input':5150,'cached':5000,'output':80})
  def test_cli_errors_fail_the_job_step(self):
   for stdout,code in [(json.dumps({'is_error':True,'result':'Not logged in · Please run /login'}),1),('not json',1)]:
    e,calls=self.use(stdout,code)
@@ -222,6 +227,70 @@ class ModelSummaryTests(unittest.TestCase):
  def test_public_job_includes_summary_only_with_input(self):
   e=FakeEngine();self.assertNotIn('model_summary',e.public({'id':'x'}))
   self.assertIn('resolution',e.public({'id':'x','input':'[Mesh]\n dim = 1\n nx = 8\n[]'})['model_summary'])
+
+class TokenSavingTests(unittest.TestCase):
+ def planning_engine(self,answers,check_valid=True,found=None):
+  e=FakeEngine();prompts=[];queue=list(answers)
+  def llm(model,prompt,schema):
+   prompts.append(prompt);e.record_usage(input=1000,cached=400,output=50);return queue.pop(0)
+  e.llm=llm;rpc=e.rpc
+  source='SOURCE_CODE_MARKER '*500
+  def fake(payload,timeout=220):
+   op=payload['op']
+   if op=='context':return {'object_paths':['NameOnlyInFullList%d'%i for i in range(3000)],'relevant_objects':[{'path':'/Kernels/Diffusion','description':'d'}],
+                            'capabilities':[{'id':'c1','summary':'neo-Hookean','objects':['NeoHooke'],'files':['x.C'],'source':[{'path':'x.C','content':source}]}]}
+   if op=='details':return [{'path':'/Kernels/'+n,'description':'doc','parameters':{'variable':{'required':True,'description':'v'*500},'control_tags':{'description':'tags'}},
+                             'source':[{'path':'k.C','source':source}]} for n in payload['paths']]
+   if op=='check':return {'valid':check_valid,'stdout':'*** ERROR: unknown parameter foo\n'+'noise line\n'*6000,'stderr':''}
+   if op=='find_ready':return found
+   return rpc(payload,timeout)
+  e.rpc=fake;return e,prompts
+ def plan_answer(self,**kw):
+  return dict({'status':'builtin','summary':'s','rationale':'','objects':['Diffusion'],'questions':[],'input':'[Mesh]\n[]'},**kw)
+ def job(self,e):
+  j=e.jobs[e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'}})['id']];return j
+ def test_usage_logged_per_call_and_totalled(self):
+  e,prompts=self.planning_engine([{'objects':['Diffusion'],'questions':[]},self.plan_answer()])
+  j=self.job(e);e.plan(j)
+  self.assertEqual(j['status'],'ready');self.assertEqual(j['usage'],{'calls':2,'input':2000,'cached':800,'output':100,'total':0,'unreported':0})
+  self.assertTrue(any('1.0k input tokens, 400 from cache, 50 output' in x['message'] for x in j['log']))
+  self.assertTrue(any(x['message'].startswith('Model usage so far: 2 call(s) (2.0k input tokens, 800 from cache, 100 output)') for x in j['log']))
+ def test_unreported_usage_is_counted(self):
+  e=FakeEngine();j={'model':{}};e.llm=lambda *a:{}
+  e.ask(j,'plan','p',engine.PLAN)
+  self.assertEqual(j['usage']['unreported'],1);self.assertIn('token usage not reported',j['log'][-1]['message'])
+ def test_prompts_leave_out_full_object_list_source_and_boilerplate(self):
+  e,prompts=self.planning_engine([{'objects':['Diffusion'],'questions':[]},self.plan_answer()])
+  e.plan(self.job(e))
+  for prompt in prompts:
+   for absent in ('NameOnlyInFullList','SOURCE_CODE_MARKER','control_tags','v'*201):self.assertNotIn(absent,prompt)
+  self.assertIn('neo-Hookean',prompts[0]);self.assertIn('/Kernels/Diffusion',prompts[1])
+ def test_repair_sends_diagnostics_not_the_planning_prompt(self):
+  e,prompts=self.planning_engine([{'objects':['Diffusion'],'questions':[]},self.plan_answer(),self.plan_answer(),self.plan_answer()],check_valid=False)
+  j=self.job(e);e.plan(j)
+  repair=prompts[2];self.assertEqual(j['status'],'failed')
+  self.assertIn('unknown parameter foo',repair);self.assertNotIn('discovery_questions',repair)
+  self.assertLess(len(repair),len(prompts[1])+8000);self.assertLess(repair.count('noise line'),400)
+ def test_unchanged_graph_reuses_validated_input_without_model_calls(self):
+  found={'id':'b'*32,'input':'[Mesh]\n[]','summary':'earlier','model':{'provider':'claude-code','id':'opus'}}
+  e,prompts=self.planning_engine([],found=found)
+  j=self.job(e);e.plan(j)
+  self.assertEqual(prompts,[]);self.assertEqual((j['status'],j['reused_from'],j['input']),('ready','b'*32,'[Mesh]\n[]'))
+  self.assertIn('no model calls',j['verification'])
+ def test_reuse_falls_back_when_recheck_fails_and_can_be_forced_off(self):
+  found={'id':'b'*32,'input':'old','model':{}}
+  e,prompts=self.planning_engine([{'objects':[],'questions':['Which material?']},self.plan_answer(status='needs_clarification',questions=['Which material?']),
+                                   self.plan_answer(status='needs_clarification',questions=['Which material?'])],check_valid=False,found=found)
+  e.plan(self.job(e));self.assertEqual(len(prompts),3)
+  e,prompts=self.planning_engine([{'objects':[],'questions':[]},self.plan_answer()],found=found)
+  calls=[];rpc=e.rpc;e.rpc=lambda p,timeout=220:calls.append(p['op']) or rpc(p,timeout)
+  j=e.jobs[e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'},'force':True})['id']];e.plan(j)
+  self.assertNotIn('find_ready',calls);self.assertNotIn('reused_from',j)
+ def test_semantic_hash_ignores_layout_and_matches_workspace(self):
+  g=graph();g['nodes'][0].update(x=10,y=20);moved=copy.deepcopy(g);moved['nodes'][0].update(x=400,y=90)
+  self.assertEqual(engine.semantic_hash(g),engine.semantic_hash(moved));self.assertEqual(engine.semantic_hash(g),workspace.semantic_hash(g))
+  changed=copy.deepcopy(g);changed['nodes'][0]['params']={'value':1}
+  self.assertNotEqual(engine.semantic_hash(g),engine.semantic_hash(changed))
 
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
@@ -399,6 +468,13 @@ class WorkspaceTests(unittest.TestCase):
   folder=self.run_render_command()
   error=json.loads((folder/'images/manifest.json').read_text())['error']
   self.assertIn('"moose" was not found',error);self.assertIn('render_conda_prefix',error)
+
+ def test_find_ready_returns_newest_matching_ready_job(self):
+  g=graph();h=workspace.semantic_hash(g)
+  for jid,status,updated,stored in (('1'*32,'ready',5,h),('2'*32,'ready',9,None),('3'*32,'failed',20,h),('4'*32,'ready',30,h)):
+   workspace.save(workspace.jobdir(jid)/'state.json',{'id':jid,'status':status,'updated_at':updated,'input':'in'+jid[0],'graph':g,**({'semantic_hash':stored} if stored else {})})
+  self.assertEqual(workspace.find_ready(h,exclude='4'*32)['id'],'2'*32)
+  self.assertEqual(workspace.find_ready(h)['id'],'4'*32);self.assertIsNone(workspace.find_ready('other'))
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())
