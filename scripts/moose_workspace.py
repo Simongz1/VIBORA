@@ -83,16 +83,33 @@ def semantic_hash(g):
  nodes=sorted(({k:v for k,v in n.items() if k not in ('x','y')} for n in g.get('nodes',[])),key=lambda n:str(n.get('id')))
  edges=sorted(g.get('edges',[]),key=lambda e:json.dumps(e,sort_keys=True))
  return hashlib.sha256(json.dumps({'request':g.get('request',''),'nodes':nodes,'edges':edges},sort_keys=True).encode()).hexdigest()
-def find_ready(semantic,exclude=None):
- # Newest ready job for the same model; older jobs without a stored hash are hashed from their graph.
- best=None
+def is_output(n):return n.get('kind')=='output' or n.get('category')=='Outputs'
+def is_solver(n):return n.get('kind')=='solver' or n.get('category')=='Executioner'
+def base_hash(g):
+ # Must match base_hash in workflow_engine.py: semantic_hash without output blocks or the solver's visualize list.
+ nodes=[]
+ for n in g.get('nodes',[]):
+  if is_output(n):n={'id':n.get('id'),'kind':n.get('kind'),'category':n.get('category')}
+  elif is_solver(n):n=dict(n,params={k:v for k,v in (n.get('params') or {}).items() if k!='visualize'})
+  nodes.append(n)
+ return semantic_hash(dict(g,nodes=nodes))
+def visualize_list(g):
+ names=[]
+ for n in (g or {}).get('nodes',[]):
+  if is_solver(n):
+   v=(n.get('params') or {}).get('visualize')
+   names+=[str(i).strip() for i in (v if isinstance(v,list) else re.split(r'[\s,;]+',str(v or ''))) if str(i).strip()]
+ return list(dict.fromkeys(names))
+def find_ready(semantic,exclude=None,key='semantic_hash'):
+ # Newest ready job with the same semantic_hash (or base_hash); older jobs without stored hashes are hashed from their graph.
+ best=None;compute=semantic_hash if key=='semantic_hash' else base_hash
  for path in (STATE/'jobs').glob('*/state.json'):
   try:state=json.loads(path.read_text())
   except (OSError,ValueError):continue
   if state.get('id')==exclude or state.get('status')!='ready' or not state.get('input'):continue
-  h=state.get('semantic_hash') or (semantic_hash(state['graph']) if isinstance(state.get('graph'),dict) else None)
+  h=state.get(key) or (compute(state['graph']) if isinstance(state.get('graph'),dict) else None)
   if h==semantic and (best is None or state.get('updated_at',0)>best.get('updated_at',0)):best=state
- return {k:best[k] for k in ('id','input','plan','summary','model','retained','updated_at') if k in best} if best else None
+ return {k:best[k] for k in ('id','input','plan','summary','model','retained','updated_at','graph') if k in best} if best else None
 def authorize(jid,plan_hash):
  path=jobdir(jid)/'state.json'
  data=json.loads(path.read_text())
@@ -186,7 +203,7 @@ def build_status(jid):
  if state:return {'status':'running' if state.startswith('RUNNING') else 'queued','scheduler':state,'scheduler_id':sid}
  log=(folder/'scheduler.log').read_text()[-8000:] if (folder/'scheduler.log').exists() else ''
  return {'status':'failed','error':'Scheduler job ended without a build result.','log':log,'scheduler_id':sid}
-RUN_FILES={'model.i','run.sbatch','run.sh','scheduler.json','exit_code','node','slurm.log','heartbeat','cancel','launcher.log','render.log'}
+RUN_FILES={'visualize.json','model.i','run.sbatch','run.sh','scheduler.json','exit_code','node','slurm.log','heartbeat','cancel','launcher.log','render.log'}
 LOGIN_MAX_RANKS=4
 LOGIN_MAX_SECONDS=3600
 def run_results(folder):
@@ -205,6 +222,7 @@ def run_results(folder):
   m=json.loads(manifest.read_text());result['images']=m.get('images',[])
   if m.get('error'):result['images_error']=m['error']
   if m.get('deformed'):result['images_deformed']=True
+  if m.get('missing'):result['images_missing']=m['missing'];result['images_available']=m.get('available',[])
  return result
 CONDA_BASES=('miniforge3','mambaforge','miniconda3','anaconda3')
 def conda_env_prefix(name):
@@ -251,6 +269,8 @@ def run_submit(jid,text,ranks,wall,where='slurm'):
   if seconds(wall)>LOGIN_MAX_SECONDS:raise ValueError('Login-node runs are limited to 01:00:00 wall time')
  else:ranks=int(ranks) or int(cfg.get('run_ranks',cfg['cpus']));wall=wall or cfg.get('run_time',cfg['time'])
  (folder/'model.i').write_text(text)
+ # The solver's visualize list tells render_results.py which Exodus fields to show.
+ save(folder/'visualize.json',{'names':visualize_list(state.get('graph'))})
  toolchain=os.pathsep.join(CONFIG.get('toolchain_bin',[]))
  head=('#!/bin/bash\nset -uo pipefail\ncd '+shlex.quote(str(folder))+'\n'
   +('export PATH='+shlex.quote(toolchain)+':"$PATH"\n' if toolchain else '')
@@ -344,7 +364,9 @@ def dispatch(r):
  if op=='save_job':save(jobdir(jid)/'state.json',r['state']);return {'saved':True}
  if op=='load_job':return json.loads((jobdir(jid)/'state.json').read_text())
  if op=='authorize':return authorize(jid,r['plan_hash'])
- if op=='find_ready':return find_ready(r['semantic_hash'],r.get('exclude'))
+ if op=='find_ready':
+  key='base_hash' if 'base_hash' in r else 'semantic_hash'
+  return find_ready(r[key],r.get('exclude'),key)
  if op=='stage':return stage(jid,r['package'])
  if op=='submit':return submit(jid)
  if op=='build_status':return build_status(jid)

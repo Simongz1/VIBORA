@@ -292,6 +292,53 @@ class TokenSavingTests(unittest.TestCase):
   changed=copy.deepcopy(g);changed['nodes'][0]['params']={'value':1}
   self.assertNotEqual(engine.semantic_hash(g),engine.semantic_hash(changed))
 
+def mechanics_graph(visualize=None,output_params=None,shear='1e9'):
+ solver={'id':'solver','kind':'solver','params':dict({'type':'Transient'},**({'visualize':visualize} if visualize else {})),'x':1,'y':2}
+ return {'request':'push the left edge','nodes':[{'id':'mat','kind':'component','category':'Materials','params':{'shear':shear}},solver,
+         {'id':'out','kind':'output','params':output_params or {},'x':5,'y':6}],'edges':[{'from':'solver','out':'solution','to':'out','in':'solution'}]}
+class OutputEditTests(unittest.TestCase):
+ def engine_with_previous(self,previous,answers=()):
+  e=FakeEngine();prompts=[];queue=list(answers);rpc=e.rpc
+  def llm(model,prompt,schema):prompts.append(prompt);return queue.pop(0)
+  e.llm=llm
+  found={'id':'f'*32,'input':(ROOT/'examples/mechanics.i').read_text(),'graph':previous,'summary':'neo-Hookean push','model':{'provider':'claude-code','id':'opus'}}
+  def fake(payload,timeout=220):
+   if payload['op']=='find_ready':return found if payload.get('base_hash')==engine.base_hash(previous) else None
+   if payload['op']=='check':return {'valid':True,'stdout':'','stderr':''}
+   if payload['op']=='context':return {'object_paths':[],'relevant_objects':[],'capabilities':[]}
+   if payload['op']=='details':return []
+   return rpc(payload,timeout)
+  e.rpc=fake;return e,prompts
+ def start(self,e,g):
+  j=e.jobs[e.start({'graph':g,'model':{'provider':'local','id':'test-model'}})['id']];e.plan(j);return j
+ def test_hashes_separate_output_settings_from_the_model(self):
+  g=mechanics_graph();vis=mechanics_graph('cauchy_stress_xx');out=mechanics_graph(output_params={'time_step_interval':2});phys=mechanics_graph(shear='2e9')
+  self.assertEqual(len({engine.base_hash(x) for x in (g,vis,out)}),1);self.assertEqual(len({engine.semantic_hash(x) for x in (g,vis,out)}),3)
+  self.assertNotEqual(engine.base_hash(g),engine.base_hash(phys));self.assertEqual(engine.base_hash(vis),workspace.base_hash(vis))
+  self.assertEqual(engine.visualize_list(mechanics_graph('cauchy_stress_xx, temperature  disp_x')),['cauchy_stress_xx','temperature','disp_x'])
+ def test_quantities_already_written_by_the_input(self):
+  text=(ROOT/'examples/mechanics.i').read_text()
+  self.assertTrue(engine.already_written(text,'disp_x'));self.assertTrue(engine.already_written(text,'cauchy_stress'))
+  self.assertTrue(engine.already_written(text,'cauchy_stress_xy'));self.assertFalse(engine.already_written(text,'vonmises_cauchy_stress'))
+ def test_already_written_quantity_needs_no_model_call(self):
+  e,prompts=self.engine_with_previous(mechanics_graph())
+  j=self.start(e,mechanics_graph('cauchy_stress_xx disp_x'))
+  self.assertEqual(prompts,[]);self.assertEqual((j['status'],j['output_edit_from']),('ready','f'*32))
+  self.assertEqual(j['input'],(ROOT/'examples/mechanics.i').read_text())
+ def test_new_output_request_is_a_small_edit_of_the_previous_input(self):
+  edited=(ROOT/'examples/mechanics.i').read_text().replace("cauchy_stress_xy'","cauchy_stress_xy vonmises_cauchy_stress'")
+  e,prompts=self.engine_with_previous(mechanics_graph(),[{'status':'builtin','summary':'Added von Mises output.','rationale':'','objects':[],'questions':[],'input':edited}])
+  j=self.start(e,mechanics_graph('vonmises_cauchy_stress',{'time_step_interval':2}))
+  self.assertEqual(len(prompts),1);self.assertEqual((j['status'],j['input']),('ready',edited))
+  self.assertIn('previous_input',prompts[0]);self.assertIn('time_step_interval',prompts[0]);self.assertIn('vonmises_cauchy_stress',prompts[0])
+  self.assertNotIn('relevant_objects',prompts[0]);self.assertLess(len(prompts[0]),8000)
+ def test_physics_change_regenerates_normally(self):
+  e,prompts=self.engine_with_previous(mechanics_graph(),[{'objects':[],'questions':[]},{'status':'builtin','summary':'s','rationale':'','objects':[],'questions':[],'input':'x'}])
+  j=self.start(e,mechanics_graph('cauchy_stress_xx',shear='2e9'))
+  self.assertNotIn('output_edit_from',j);self.assertEqual(len(prompts),2)
+ def test_generation_prompt_explains_visualize(self):
+  self.assertIn('never write visualize itself into the input',engine.INSTRUCTIONS)
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[
@@ -475,6 +522,18 @@ class WorkspaceTests(unittest.TestCase):
    workspace.save(workspace.jobdir(jid)/'state.json',{'id':jid,'status':status,'updated_at':updated,'input':'in'+jid[0],'graph':g,**({'semantic_hash':stored} if stored else {})})
   self.assertEqual(workspace.find_ready(h,exclude='4'*32)['id'],'2'*32)
   self.assertEqual(workspace.find_ready(h)['id'],'4'*32);self.assertIsNone(workspace.find_ready('other'))
+
+ def test_find_ready_by_base_hash_returns_graph(self):
+  g=mechanics_graph('temperature');workspace.save(workspace.jobdir('1'*32)/'state.json',{'id':'1'*32,'status':'ready','input':'in','graph':g,'updated_at':1})
+  found=workspace.find_ready(workspace.base_hash(mechanics_graph('cauchy_stress_xx')),key='base_hash')
+  self.assertEqual((found['id'],found['graph']),('1'*32,g))
+  self.assertIsNone(workspace.find_ready(workspace.semantic_hash(mechanics_graph('cauchy_stress_xx'))))
+ def test_run_writes_visualize_list_for_images(self):
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'[Mesh]\n[]','graph':mechanics_graph('cauchy_stress_xx temperature')})
+  original=workspace.run;workspace.run=lambda args,**kw:{'returncode':0,'stdout':'5\n','stderr':''}
+  self.addCleanup(setattr,workspace,'run',original)
+  workspace.run_submit(self.jid,'[Mesh]\n[]',2,'')
+  self.assertEqual(json.loads((workspace.jobdir(self.jid)/'run/visualize.json').read_text()),{'names':['cauchy_stress_xx','temperature']})
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())

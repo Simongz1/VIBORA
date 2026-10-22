@@ -16,22 +16,27 @@ def exodus(path,dim=2,uniform=False):
   times=f.createVariable('time_whole','f8',('time_step',))
   names=f.createVariable('name_nod_var','S1',('num_nod_var','len_name'))
   for i,n in enumerate(['disp_x','disp_y','temp']):names[i]=netCDF4.stringtoarr(n,33)
+  # One element field, as MOOSE writes stress components from generate_output.
+  f.createDimension('num_elem_var',1)
+  enames=f.createVariable('name_elem_var','S1',('num_elem_var','len_name'));enames[0]=netCDF4.stringtoarr('cauchy_stress_xx',33)
+  stress=f.createVariable('vals_elem_var1eb1','f8',('time_step','num_el_in_blk1'))
   for t in range(5):
-   times[t]=0.1*t
+   times[t]=0.1*t;stress[t]=[1e6*t*k for k in (1,2,3,4)]
    for i,v in enumerate([0.01*t*x,0*y,300+0*x if uniform else 300+10*t*x]):
     if t==0:f.createVariable('vals_nod_var%d'%(i+1),'f8',('time_step','num_nodes'))
     f.variables['vals_nod_var%d'%(i+1)][t]=v
 @unittest.skipUnless(HAVE,'numpy, matplotlib and netCDF4 are needed to test result images')
 class RenderTests(unittest.TestCase):
- def run_render(self,dim=2,uniform=False):
+ def run_render(self,dim=2,uniform=False,visualize=None):
   tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);folder=Path(tmp.name)
   exodus(folder/'model_out.e',dim,uniform)
+  if visualize is not None:(folder/'visualize.json').write_text(json.dumps({'names':visualize}))
   subprocess.run([sys.executable,str(ROOT/'scripts/render_results.py'),str(folder)],check=True,capture_output=True)
   return folder,json.loads((folder/'images/manifest.json').read_text())
  def test_snapshots_at_selected_times_on_deformed_mesh(self):
   folder,m=self.run_render()
   self.assertTrue(m['deformed']);self.assertNotIn('error',m)
-  self.assertEqual(sorted({i['variable'] for i in m['images']}),['disp_x','disp_y','temp'])
+  self.assertEqual(sorted({i['variable'] for i in m['images']}),['cauchy_stress_xx','disp_x','disp_y','temp'])
   temp=[i for i in m['images'] if i['variable']=='temp']
   self.assertEqual([i['step'] for i in temp],[0,1,3,4]);self.assertEqual(temp[0]['variable'],m['images'][0]['variable'])
   for i in m['images']:self.assertEqual((folder/'images'/i['file']).read_bytes()[:4],b'\x89PNG')
@@ -40,6 +45,12 @@ class RenderTests(unittest.TestCase):
   temp=[i for i in m['images'] if i['variable']=='temp']
   self.assertEqual(len(temp),1);self.assertEqual((temp[0]['uniform'],temp[0]['time'],temp[0]['time_end']),(300.0,0.0,0.4))
   self.assertEqual(len([i for i in m['images'] if i['variable']=='disp_x']),4)
+ def test_visualize_list_selects_fields_including_element_stress(self):
+  folder,m=self.run_render(visualize=['cauchy_stress','temp','vonmises_stress'])
+  self.assertEqual([i['variable'] for i in m['images'][::4]],['cauchy_stress_xx','temp'])
+  self.assertEqual({i['location'] for i in m['images'] if i['variable']=='cauchy_stress_xx'},{'element'})
+  self.assertEqual(m['missing'],['vonmises_stress']);self.assertIn('disp_x',m['available'])
+  for i in m['images']:self.assertEqual((folder/'images'/i['file']).read_bytes()[:4],b'\x89PNG')
  def test_three_dimensional_mesh_reports_clear_error(self):
   folder,m=self.run_render(3)
   self.assertIn('3D',m['error']);self.assertEqual(list((folder/'images').glob('*.png')),[])

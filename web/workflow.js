@@ -38,9 +38,10 @@ $('#new-model').onclick=()=>{
 const kTokens=n=>n>=1000?(n/1000).toFixed(1)+'k':String(n);
 function usageLabel(job){
  if(job.reused_from&&!job.usage?.calls)return ' · reused job '+job.reused_from.slice(0,8)+', no model calls';
- const u=job.usage;if(!u?.calls)return '';
+ const edit=job.output_edit_from?' · output-only edit of job '+job.output_edit_from.slice(0,8):'';
+ const u=job.usage;if(!u?.calls)return edit+(edit?', no model calls':'');
  const counted=u.input||u.output?kTokens(u.input)+' input'+(u.cached?' ('+kTokens(u.cached)+' cached)':'')+', '+kTokens(u.output)+' output tokens':u.total?kTokens(u.total)+' tokens':'tokens not reported';
- return ' · '+u.calls+' model call'+(u.calls>1?'s':'')+', '+counted;
+ return edit+' · '+u.calls+' model call'+(u.calls>1?'s':'')+', '+counted;
 }
 const RUN_ACTIVE=['submitting','queued','running'];
 function renderLog(entries,active){
@@ -92,8 +93,10 @@ function showSummary(summary){
 let galleryKey='';
 function showImages(job,run){
  const images=run.images||[],variables=[...new Set(images.map(i=>i.variable))];
- $('#run-images').hidden=!(images.length||run.images_error)||RUN_ACTIVE.includes(run.status);
- $('#run-images-note').textContent=run.images_error||(run.images_deformed?'Shown on the deformed mesh.':'');
+ $('#run-images').hidden=!(images.length||run.images_error||run.images_missing?.length)||RUN_ACTIVE.includes(run.status);
+ const notes=[run.images_error||(run.images_deformed?'Shown on the deformed mesh.':'')];
+ if(run.images_missing?.length)notes.push('Not in the Exodus output: '+run.images_missing.join(', ')+'. Available: '+(run.images_available||[]).join(', ')+'.');
+ $('#run-images-note').textContent=notes.filter(Boolean).join(' ');
  const select=$('#run-variable'),chosen=variables.includes(select.value)?select.value:variables[0];
  const key=JSON.stringify([job.id,run.scheduler_id,run.node,images,chosen]);if(key===galleryKey)return;galleryKey=key;
  select.replaceChildren(...variables.map(v=>{const o=el('option',v);o.value=v;o.selected=v===chosen;return o;}));
@@ -113,7 +116,7 @@ function showJob(job){
  currentJob=job;$('#job-status').hidden=false;
  $('#job-title').textContent=job.status.replaceAll('_',' ');
  $('#job-model').textContent=(job.model?.provider||'')+' / '+(job.model?.id||'')+usageLabel(job);
- $('#regenerate').hidden=!(job.reused_from&&job.status==='ready');
+ $('#regenerate').hidden=!((job.reused_from||job.output_edit_from)&&job.status==='ready');
  $('#job-summary').textContent=job.summary||job.error||'';
  $('#job-questions').replaceChildren();
  for(const q of job.questions||[])$('#job-questions').append(el('p',q,'issue'));

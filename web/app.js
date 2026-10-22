@@ -77,7 +77,13 @@ function inspect(){
   field(box,'MOOSE object type (optional)',n.object_type||'',v=>n.object_type=v);
   field(box,'Object parameters (JSON)',JSON.stringify(n.params,null,2),v=>{const p=JSON.parse(v);if(!p||Array.isArray(p)||typeof p!=='object')throw Error('Parameters must be a JSON object.');n.params=p;},'textarea');
  }
- else for(const [k,v] of Object.entries(n.params))field(box,k,v,v=>n.params[k]=v,typeof v==='number'?'number':'text');
+ else if(n.kind==='output')field(box,'Output settings (JSON, e.g. {"time_step_interval": 2})',JSON.stringify(n.params,null,2),v=>{const p=JSON.parse(v);if(!p||Array.isArray(p)||typeof p!=='object')throw Error('Settings must be a JSON object.');n.params=p;},'textarea');
+ else for(const [k,v] of Object.entries(n.params))if(k!=='visualize')field(box,k,v,v=>n.params[k]=v,typeof v==='number'?'number':'text');
+ if(n.kind==='solver'){
+  // VIBORA setting, not a MOOSE parameter: these quantities are written to Exodus and shown as result images.
+  field(box,'Visualize (space-separated, e.g. cauchy_stress_xx temperature)',n.params.visualize||'',v=>{if(v.trim())n.params.visualize=v.trim();else delete n.params.visualize;});
+  box.append(el('p','Variables, aux variables, stress components or material properties to show after a run. Changing only this or the Results block edits the existing input instead of regenerating the model.','muted'));
+ }
  for(const direction of ['inputs','outputs']){
   const ports=n[direction]||spec(n.kind)[direction];
   field(box,direction+' (name:type, …)',ports.map(p=>p.name+':'+p.type).join(', '),value=>{
