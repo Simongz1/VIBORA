@@ -7,6 +7,8 @@ const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefine
 function status(t){$('#status').textContent=t;}
 function invalidate(){generated='';resolvedGraph=null;try{localStorage.setItem('vibora-draft',JSON.stringify(graph));}catch(e){}$('#issues').replaceChildren(el('p','Assembly changed. Check dependencies again.','muted'));scheduleCheck();}
 let timer;
+// Display zoom only: block coordinates stay unscaled, so saved graphs and layouts are unaffected.
+let zoom=1;const ZOOM_MIN=0.1,ZOOM_MAX=2;
 function scheduleCheck(){clearTimeout(timer);timer=setTimeout(()=>check(false,true),650);}
 function spec(k){return catalog.find(x=>x.kind===k)||(k==='component'?{kind:k,params:{},inputs:[{name:'dependency',type:'object'}],outputs:[{name:'object',type:'object'}]}:undefined);}
 function node(kind,x=80,y=60,label){return {id:'b_'+crypto.randomUUID().replaceAll('-',''),kind,label:label||descriptions[kind][1],params:clone(spec(kind).params),physics:'',method:'',implementation:'',x,y};}
@@ -14,19 +16,40 @@ const mooseCategories=['Materials','ICs','BCs','Postprocessors','Kernels','Varia
 function sizeCanvas(){
  const width=Math.max(1500,...graph.nodes.map(n=>n.x+240)),height=Math.max(1000,...graph.nodes.map(n=>n.y+240));
  $('#canvas').style.width=width+'px';$('#canvas').style.height=height+'px';
+ $('#canvas').style.transform='scale('+zoom+')';
+ $('#zoom-area').style.width=width*zoom+'px';$('#zoom-area').style.height=height*zoom+'px';
+ $('#zoom-reset').textContent=Math.round(zoom*100)+'%';
+}
+function setZoom(value,anchorX,anchorY){
+ // Keeps the canvas point under (anchorX, anchorY), in viewport pixels, in place; defaults to the view centre.
+ const view=$('#viewport'),next=Math.min(ZOOM_MAX,Math.max(ZOOM_MIN,value));
+ if(anchorX===undefined){anchorX=view.clientWidth/2;anchorY=view.clientHeight/2;}
+ const x=(view.scrollLeft+anchorX)/zoom,y=(view.scrollTop+anchorY)/zoom;
+ zoom=next;sizeCanvas();drawWires();
+ view.scrollLeft=x*zoom-anchorX;view.scrollTop=y*zoom-anchorY;
+}
+function zoomToFit(onlyIfLarger){
+ const view=$('#viewport'),cards=[...document.querySelectorAll('.node')];if(!cards.length)return;
+ const left=Math.min(...graph.nodes.map(n=>n.x)),top=Math.min(...graph.nodes.map(n=>n.y));
+ const right=Math.max(...cards.map(c=>c.offsetLeft+c.offsetWidth)),bottom=Math.max(...cards.map(c=>c.offsetTop+c.offsetHeight));
+ const fit=Math.min((view.clientWidth-40)/(right-left),(view.clientHeight-40)/(bottom-top),1);
+ if(onlyIfLarger&&fit>=zoom)return;
+ zoom=Math.min(ZOOM_MAX,Math.max(ZOOM_MIN,fit));sizeCanvas();drawWires();
+ view.scrollLeft=left*zoom-20;view.scrollTop=top*zoom-20;
 }
 function add(kind,label,properties={}){
- const view=$('#viewport');let x=view.scrollLeft+Math.max(20,(view.clientWidth-188)/2),y=view.scrollTop+40;
+ const view=$('#viewport');let x=view.scrollLeft/zoom+Math.max(20,(view.clientWidth/zoom-188)/2),y=view.scrollTop/zoom+40;
  while(graph.nodes.some(n=>Math.abs(n.x-x)<195&&Math.abs(n.y-y)<130))y+=150;
  const n=Object.assign(node(kind,x,y,label),properties);graph.nodes.push(n);selected=n.id;render();inspect();invalidate();
- view.scrollTo({left:Math.max(0,n.x-(view.clientWidth-188)/2),top:Math.max(0,n.y-40)});status('Added '+n.label);return n;
+ view.scrollTo({left:Math.max(0,n.x*zoom-(view.clientWidth-188*zoom)/2),top:Math.max(0,(n.y-40)*zoom)});status('Added '+n.label);return n;
 }
 function drawWires(){
  const svg=$('#wires');svg.replaceChildren();
  for(const e of graph.edges){
   const a=document.getElementById(e.from+'-out-'+e.out),b=document.getElementById(e.to+'-in-'+e.in);if(!a||!b)continue;
   const canvas=$('#canvas').getBoundingClientRect(),ar=a.getBoundingClientRect(),br=b.getBoundingClientRect();
-  const x1=ar.right-canvas.left-5,y1=ar.top-canvas.top+ar.height/2,x2=br.left-canvas.left+5,y2=br.top-canvas.top+br.height/2;
+  // Screen rectangles are scaled by the zoom; the SVG lives in unscaled canvas coordinates.
+  const x1=(ar.right-canvas.left)/zoom-5,y1=(ar.top-canvas.top+ar.height/2)/zoom,x2=(br.left-canvas.left)/zoom+5,y2=(br.top-canvas.top+br.height/2)/zoom;
   const path=document.createElementNS('http://www.w3.org/2000/svg','path');
   path.setAttribute('d','M '+x1+' '+y1+' C '+(x1+65)+' '+y1+', '+(x2-65)+' '+y2+', '+x2+' '+y2);
   const title=document.createElementNS('http://www.w3.org/2000/svg','title');title.textContent='Click to remove connection';path.append(title);
@@ -42,7 +65,7 @@ function render(){
   const card=el('section',undefined,'node'+(selected===n.id?' selected':''));card.id=n.id;card.style.left=n.x+'px';card.style.top=n.y+'px';
   const head=el('div',undefined,'node-head');head.append(el('b',n.label),el('small',n.kind==='solver'?(n.params.type||'Steady')+' · '+(n.params.solve_type||'PJFNK'):(n.category||descriptions[n.kind][2])+(n.object_type?' · '+n.object_type:'')));card.append(head);
   head.onpointerdown=e=>{if(e.button!==0)return;selected=n.id;inspect();document.querySelectorAll('.node').forEach(c=>c.classList.toggle('selected',c.id===n.id));drag={n,x:e.clientX,y:e.clientY,ox:n.x,oy:n.y};head.setPointerCapture(e.pointerId);};
-  head.onpointermove=e=>{if(!drag||drag.n!==n)return;n.x=Math.max(5,drag.ox+e.clientX-drag.x);n.y=Math.max(5,drag.oy+e.clientY-drag.y);card.style.left=n.x+'px';card.style.top=n.y+'px';drawWires();};
+  head.onpointermove=e=>{if(!drag||drag.n!==n)return;n.x=Math.max(5,drag.ox+(e.clientX-drag.x)/zoom);n.y=Math.max(5,drag.oy+(e.clientY-drag.y)/zoom);card.style.left=n.x+'px';card.style.top=n.y+'px';drawWires();};
   head.onpointerup=()=>{drag=null;sizeCanvas();invalidate();};
   head.onpointercancel=()=>{drag=null;};
   const ports=el('div',undefined,'ports');
@@ -156,7 +179,7 @@ $('#file').onchange=async e=>{
    n.x=Number.isFinite(n.x)?Math.max(5,n.x):50;n.y=Number.isFinite(n.y)?Math.max(5,n.y):50;
   }
   for(const edge of g.edges)if(!edge||!['from','out','to','in'].every(k=>typeof edge[k]==='string'))throw Error('Invalid connection.');
-  graph=g;selected=null;pending=null;$('#model-title').textContent=file.name;render();inspect();invalidate();
+  graph=g;selected=null;pending=null;$('#model-title').textContent=file.name;render();inspect();invalidate();zoomToFit(true);
  }catch(err){status('Open failed: '+err.message);}finally{e.target.value='';}
 };
 $('#example').onclick=()=>{if(!graph.nodes.length||confirm('Replace the current graph with the diffusion example? Save first to keep your edits.'))example();};
@@ -184,3 +207,13 @@ async function start(){
  }catch(e){status('Cannot load block catalog. Start the C++ backend.');}
 }
 start();
+
+$('#zoom-in').onclick=()=>setZoom(zoom*1.25);
+$('#zoom-out').onclick=()=>setZoom(zoom/1.25);
+$('#zoom-reset').onclick=()=>setZoom(1);
+$('#zoom-fit').onclick=()=>zoomToFit(false);
+// Ctrl/Cmd + wheel, and trackpad pinch (reported as a ctrl wheel), zoom around the pointer; a plain wheel still scrolls.
+$('#viewport').addEventListener('wheel',e=>{
+ if(!e.ctrlKey&&!e.metaKey)return;e.preventDefault();
+ const r=$('#viewport').getBoundingClientRect();setZoom(zoom*Math.exp(-e.deltaY*0.0015),e.clientX-r.left,e.clientY-r.top);
+},{passive:false});
