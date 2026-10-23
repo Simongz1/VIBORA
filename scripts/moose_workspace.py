@@ -449,6 +449,15 @@ def dispatch(r):
  if op=='save_job':save(jobdir(jid)/'state.json',r['state']);return {'saved':True}
  if op=='load_job':return json.loads((jobdir(jid)/'state.json').read_text())
  if op=='authorize':return authorize(jid,r['plan_hash'])
+ if op=='import_input':
+  # Deterministic MOOSE input -> block graph; keeps the input and its fingerprint for no-token reuse.
+  text=r.get('text','')
+  if not isinstance(text,str) or not text.strip() or len(text)>500000:raise ValueError('The input file is empty or larger than 500 kB')
+  sys.path.insert(0,str(ROOT/'scripts'));import input_import
+  g=input_import.to_graph(text,str(r.get('name') or 'model.i'))
+  if not g['nodes']:raise ValueError('No MOOSE blocks were found in this file')
+  g['source_input']=text;g['source_hash']=semantic_hash(g)
+  return g
  if op=='find_ready':
   key='base_hash' if 'base_hash' in r else 'semantic_hash'
   return find_ready(r[key],r.get('exclude'),key)

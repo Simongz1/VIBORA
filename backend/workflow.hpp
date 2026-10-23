@@ -29,5 +29,6 @@ void register_workflow(httplib::Server& server) {
   if(!file){r.status=404;r.set_content(R"({"error":"Result image not found."})","application/json");return;}
   std::ostringstream data;data<<file.rdbuf();r.set_content(data.str(),"image/png");
  });
+ server.Post("/api/graph/import",[](const auto& req,auto& r){workflow_proxy("/graph/import",req.body,r);});
  server.Post("/api/graph/check",[](const auto& req,auto& r){workflow_proxy("/graph/check",req.body,r);});
 }

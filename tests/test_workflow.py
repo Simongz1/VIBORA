@@ -5,6 +5,7 @@ def load(name,path):
  spec=importlib.util.spec_from_file_location(name,ROOT/path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
 engine=load('workflow','scripts/workflow_engine.py')
 workspace=load('workspace','scripts/moose_workspace.py')
+importer=load('input_import','scripts/input_import.py')
 def graph():return {'nodes':[{'id':'physics','kind':'component','physics':'thermoelasticity','params':{}}],'edges':[]}
 class FakeEngine(engine.Engine):
  def __init__(self):
@@ -464,6 +465,93 @@ class RetainedCapabilityPromptTests(unittest.TestCase):
   self.assertNotIn('detonation_velocity',prompts[0]);self.assertIn('detonation_velocity',prompts[1]);self.assertIn('detonation_velocity',prompts[2])
   self.assertNotIn('NEO_SOURCE',prompts[1]+prompts[2])
   self.assertTrue(any('does not document: ViboraHotspotJWLJ2' in x['message'] for x in j['log']))
+
+class InputImportTests(unittest.TestCase):
+ def nodes(self,g):return {(n.get('category') or n['kind'],n['label']):n for n in g['nodes']}
+ def edges(self,g):
+  ids={n['id']:n['label'] for n in g['nodes']}
+  return {(ids[e['from']],ids[e['to']],e['in']) for e in g['edges']}
+ def test_example_input_becomes_a_connected_graph(self):
+  g=importer.to_graph((ROOT/'examples/mechanics.i').read_text(),'mechanics.i')
+  n=self.nodes(g)
+  self.assertEqual(n[('mesh','Mesh')]['params'],{'type':'GeneratedMesh','dim':2,'nx':20,'ny':20})
+  self.assertEqual(n[('BCs','left_push')]['object_type'],'FunctionDirichletBC');self.assertIn('constant-velocity push',n[('BCs','left_push')]['physics'])
+  self.assertEqual(n[('Materials','stress')]['params'],{'bulk_modulus':'bulk','shear_modulus':'shear','deviatoric_form':'literal'})
+  self.assertIn(('Physics/SolidMechanics/QuasiStatic','all'),n);self.assertEqual(n[('solver','Executioner')]['params']['num_steps'],10)
+  self.assertTrue({('material_constants','stress','bulk_modulus'),('left_push','left_push','function'),('disp_y','no_vertical_displacement','variable'),
+                   ('Mesh','disp_x','mesh'),('Executioner','Outputs','solution')}<=self.edges(g))
+  self.assertTrue(g['request'].startswith('Quasi-static'));self.assertEqual(engine.graph_errors(g),[])
+  for e in g['edges']:
+   src=next(x for x in g['nodes'] if x['id']==e['from']);dst=next(x for x in g['nodes'] if x['id']==e['to'])
+   self.assertIn(e['out'],[q['name'] for q in src['outputs']]);self.assertIn(e['in'],[q['name'] for q in dst['inputs']])
+ def test_older_syntax_nested_blocks_multiline_values_and_variables(self):
+  text="""# heat in a bar
+k = 5
+[Mesh]
+  [gen]
+    type = GeneratedMeshGenerator
+    dim = 1
+    nx = 10
+  []
+[]
+[Variables]
+  [./T]
+    [./InitialCondition]
+      type = FunctionIC
+      function = start # initial profile
+    [../]
+  [../]
+[]
+[Functions/start]
+  type = ParsedFunction
+  expression = '300 + x # not a comment'
+[]
+[Materials]
+  [k]
+    type = GenericConstantMaterial
+    prop_names = 'conductivity
+                  density'
+    prop_values = '${k} 1'
+  []
+[]
+[Kernels/diff]
+  type = HeatConduction
+  variable = T
+  diffusion_coefficient = conductivity
+[]
+"""
+  g=importer.to_graph(text,'bar.i');n=self.nodes(g)
+  self.assertEqual(n[('Mesh','gen')]['object_type'],'GeneratedMeshGenerator');self.assertNotIn(('mesh','Mesh'),n)
+  self.assertEqual(n[('Variables/T','InitialCondition')]['object_type'],'FunctionIC')
+  self.assertEqual(n[('Functions','start')]['params']['expression'],'300 + x # not a comment')
+  self.assertEqual(n[('Materials','k')]['params']['prop_values'],'5 1');self.assertIn('k = 5',g['request'])
+  self.assertTrue({('start','InitialCondition','function'),('T','diff','variable'),('k','diff','diffusion_coefficient')}<=self.edges(g))
+  self.assertFalse(any(label in ('Variables','Materials','Kernels') for _,label in n))
+ def test_workspace_import_keeps_the_input_and_its_fingerprint(self):
+  text=(ROOT/'examples/mechanics.i').read_text()
+  g=workspace.dispatch({'op':'import_input','name':'mechanics.i','text':text})
+  self.assertEqual(g['source_input'],text);self.assertEqual(g['source_hash'],workspace.semantic_hash(g));self.assertEqual(g['imported_from'],'mechanics.i')
+  with self.assertRaises(ValueError):workspace.dispatch({'op':'import_input','name':'x.i','text':'  '})
+ def test_unchanged_import_needs_no_model_call_and_edits_generate(self):
+  text=(ROOT/'examples/mechanics.i').read_text()
+  g=importer.to_graph(text,'mechanics.i');g['source_input']=text;g['source_hash']=engine.semantic_hash(g)
+  e=FakeEngine();prompts=[];rpc=e.rpc
+  e.llm=lambda model,prompt,schema:prompts.append(prompt) or {'objects':[],'questions':['Which?']}
+  def fake(payload,timeout=220):
+   if payload['op']=='check':return {'valid':True,'stdout':'','stderr':''}
+   if payload['op']=='context':return {'object_paths':[],'relevant_objects':[],'capabilities':[]}
+   if payload['op']=='details':return []
+   return rpc(payload,timeout)
+  e.rpc=fake
+  j=e.jobs[e.start({'graph':copy.deepcopy(g),'model':{'provider':'local','id':'test-model'}})['id']];e.plan(j)
+  self.assertEqual(prompts,[]);self.assertEqual((j['status'],j['input']),('ready',text))
+  # An edited graph generates normally, and the original input travels with the graph into the planning prompt.
+  edited=copy.deepcopy(g);edited['nodes'][0]['params']['displacements']='disp_x'
+  answers=[{'objects':[],'questions':[]},{'status':'builtin','summary':'s','rationale':'','objects':[],'questions':[],'input':'edited'}]
+  e.llm=lambda model,prompt,schema:prompts.append(prompt) or answers.pop(0)
+  j=e.jobs[e.start({'graph':edited,'model':{'provider':'local','id':'test-model'}})['id']];e.plan(j)
+  self.assertEqual(len(prompts),2);self.assertEqual((j['status'],j['input']),('ready','edited'))
+  self.assertIn('ComputeLagrangianCompressibleNeoHookeanStress',prompts[1]);self.assertIn('source_input',prompts[1])
 
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):

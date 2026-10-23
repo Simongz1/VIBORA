@@ -29,7 +29,8 @@ function setZoom(value,anchorX,anchorY){
  view.scrollLeft=x*zoom-anchorX;view.scrollTop=y*zoom-anchorY;
 }
 function zoomToFit(onlyIfLarger){
- const view=$('#viewport'),cards=[...document.querySelectorAll('.node')];if(!cards.length)return;
+ // A hidden tab or collapsed pane has no size to fit into; keep the current zoom then.
+ const view=$('#viewport'),cards=[...document.querySelectorAll('.node')];if(!cards.length||view.clientWidth<60||view.clientHeight<60)return;
  const left=Math.min(...graph.nodes.map(n=>n.x)),top=Math.min(...graph.nodes.map(n=>n.y));
  const right=Math.max(...cards.map(c=>c.offsetLeft+c.offsetWidth)),bottom=Math.max(...cards.map(c=>c.offsetTop+c.offsetHeight));
  const fit=Math.min((view.clientWidth-40)/(right-left),(view.clientHeight-40)/(bottom-top),1);
@@ -158,11 +159,8 @@ function download(name,text,type){const url=URL.createObjectURL(new Blob([text],
 $('#validate').onclick=()=>check();$('#generate').onclick=()=>check(true);
 $('#save').onclick=()=>download('vibora.json',JSON.stringify(graph,null,2),'application/json');
 $('#load').onclick=()=>$('#file').click();
-$('#file').onchange=async e=>{
- const file=e.target.files[0];if(!file)return;
- try{
-  if(file.size>1024*1024)throw Error('Graph exceeds 1 MB.');
-  const g=JSON.parse(await file.text());
+// Shared by Open and Import input: validates a graph, normalizes block fields and shows it.
+function loadGraph(g,title){
   if(!g||!Array.isArray(g.nodes)||!Array.isArray(g.edges)||g.nodes.length>500||g.edges.length>2000)throw Error('Invalid graph structure.');
   const ids=new Set();
   for(const n of g.nodes){
@@ -172,8 +170,24 @@ $('#file').onchange=async e=>{
    n.x=Number.isFinite(n.x)?Math.max(5,n.x):50;n.y=Number.isFinite(n.y)?Math.max(5,n.y):50;
   }
   for(const edge of g.edges)if(!edge||!['from','out','to','in'].every(k=>typeof edge[k]==='string'))throw Error('Invalid connection.');
-  graph=g;selected=null;pending=null;$('#model-title').textContent=file.name;render();inspect();invalidate();zoomToFit(true);
- }catch(err){status('Open failed: '+err.message);}finally{e.target.value='';}
+  graph=g;selected=null;pending=null;$('#model-title').textContent=title;render();inspect();invalidate();zoomToFit(true);
+}
+$('#file').onchange=async e=>{
+ const file=e.target.files[0];if(!file)return;
+ try{if(file.size>1024*1024)throw Error('Graph exceeds 1 MB.');loadGraph(JSON.parse(await file.text()),file.name);}
+ catch(err){status('Open failed: '+err.message);}finally{e.target.value='';}
+};
+$('#import-input').onclick=()=>{if(!graph.nodes.length||confirm('Replace the current graph with one built from a MOOSE input file? Save first to keep your edits.'))$('#input-file').click();};
+$('#input-file').onchange=async e=>{
+ const file=e.target.files[0];if(!file)return;
+ try{
+  if(file.size>500*1024)throw Error('Input file exceeds 500 kB.');
+  status('Importing '+file.name+'…');
+  const r=await fetch('/api/graph/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,text:await file.text()})});
+  const g=await r.json();if(!r.ok)throw Error(g.error||'Import failed');
+  loadGraph(g,file.name);
+  status('Imported '+file.name+': '+g.nodes.length+' blocks, '+g.edges.length+' connections. Implement & generate checks this input without calling the model until you change the graph.');
+ }catch(err){status('Import failed: '+err.message);}finally{e.target.value='';}
 };
 $('#custom').onclick=()=>$('#creator').showModal();
 $('#create').onclick=e=>{

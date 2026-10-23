@@ -464,7 +464,7 @@ class Engine:
   threading.Thread(target=work,daemon=True).start()
  def plan(self,j):
   self.persist(j)
-  if not j.get('force') and (self.reuse(j) or self.output_edit(j)):return
+  if not j.get('force') and (self.reuse(j) or self.output_edit(j) or self.from_import(j)):return
   self.log(j,'Loading the MOOSE object catalog and retained capabilities.')
   context=self.rpc({'op':'context','graph':j['graph']})
   self.log(j,'Catalog loaded: '+str(len(context.get('object_paths',[])))+' registered objects, '+str(len(context.get('capabilities',[])))+' retained VIBORA capabilities.')
@@ -500,6 +500,18 @@ class Engine:
    self.log(j,'The reused input no longer passes --check-input; generating a new one.');return False
   self.update(j,status='ready',summary=found.get('summary') or 'Reused validated input.',input=found['input'],plan=found.get('plan'),validation=check,
               reused_from=found['id'],retained=found.get('retained'),verification='Reused from job '+found['id'][:8]+'; MOOSE --check-input passed again; no model calls and no full simulation were run.')
+  return True
+ def from_import(self,j):
+  # A graph imported from an input file and left unchanged runs that input: one MOOSE check, no model calls.
+  g=j['graph']
+  if not g.get('source_input') or g.get('source_hash')!=j['semantic_hash']:return False
+  self.log(j,'This graph is unchanged since it was imported from '+str(g.get('imported_from') or 'an input file')+'; checking that input instead of calling the model.')
+  self.update(j,status='checking',summary='Checking the imported input with the installed MOOSE application.')
+  check=self.rpc({'op':'check','id':j['id'],'input':g['source_input']})
+  if not check.get('valid'):
+   self.log(j,'The imported input does not pass --check-input; generating a new one from the graph (the original input is passed along).');return False
+  self.update(j,status='ready',summary='Imported from '+str(g.get('imported_from') or 'an input file')+'.',input=g['source_input'],validation=check,
+              verification='Imported input; MOOSE --check-input passed; no model calls and no full simulation were run.')
   return True
  def output_edit(self,j):
   # Only outputs changed since a ready job: edit its input instead of rebuilding the model.
@@ -704,6 +716,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
   if path=='/jobs/status':return self.public(self.get(data['id']))
   if path=='/jobs/run':return self.run(data)
   if path=='/jobs/cancel_run':return self.cancel_run(data)
+  if path=='/graph/import':return self.rpc({'op':'import_input','name':data.get('name'),'text':data.get('text')})
   if path=='/graph/check':
    errors=graph_errors(data);return {'valid':not errors,'issues':[{'message':e,'severity':'error'} for e in errors]}
   raise ValueError('Unknown workflow endpoint')
