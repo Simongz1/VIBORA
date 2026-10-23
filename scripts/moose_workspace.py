@@ -37,10 +37,14 @@ def app_digest():
    h.update(str(p.relative_to(ROOT)).encode());h.update(p.read_bytes())
  return h.hexdigest()
 def catalog():
- path=STATE/'catalog'/(BASE.name+'.json')
+ # Read from the app VIBORA runs (vibora_physics-opt once a capability is verified), so retained
+ # custom objects are documented like any other object. A rebuilt executable gets a fresh cache.
+ exe=executable()
+ if not exe.exists():raise RuntimeError('MOOSE executable not found: '+str(exe)+'. Set moose_executable in config.local.json (see docs/SETUP.md).')
+ info=exe.stat();stamp=hashlib.sha256((str(exe)+'|'+str(info.st_size)+'|'+str(info.st_mtime)).encode()).hexdigest()[:12]
+ path=STATE/'catalog'/(exe.name+'-'+stamp+'.json')
  if not path.exists():
-  if not BASE.exists():raise RuntimeError('MOOSE executable not found: '+str(BASE)+'. Set moose_executable in config.local.json (see docs/SETUP.md).')
-  p=subprocess.run([str(BASE),'--json'],text=True,capture_output=True,timeout=180)
+  p=subprocess.run([str(exe),'--json'],text=True,capture_output=True,timeout=300)
   text=p.stdout.split('**START JSON DATA**')[-1].split('**END JSON DATA**')[0]
   data=json.loads(text);path.parent.mkdir(exist_ok=True);save(path,data)
  data=json.loads(path.read_text());entries={}

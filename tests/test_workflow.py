@@ -441,6 +441,30 @@ class CustomRepairTests(unittest.TestCase):
   e.monitor(j)
   self.assertIn('every source file (unchanged ones too)',prompts[0]);self.assertIn('initial condition is being defined twice',prompts[0])
 
+class RetainedCapabilityPromptTests(unittest.TestCase):
+ caps=[{'id':'h'*32,'summary':'hotspot JWL with J2','objects':['ViboraHotspotJWLJ2'],'source':[{'path':'src/materials/ViboraHotspotJWLJ2.C','content':'params.addRequiredParam<Real>("detonation_velocity","D");'}]},
+       {'id':'n'*32,'summary':'neo-Hookean','objects':['NeoHooke'],'source':[{'path':'x.C','content':'NEO_SOURCE'}]}]
+ def test_source_only_for_needed_objects_missing_from_the_catalog(self):
+  out=engine.brief_capabilities(self.caps,['Materials/ViboraHotspotJWLJ2','GeneratedMesh'],['/Mesh/GeneratedMesh'])
+  self.assertIn('detonation_velocity',json.dumps(out[0]));self.assertNotIn('source',out[1])
+  documented=engine.brief_capabilities(self.caps,['ViboraHotspotJWLJ2'],['/Materials/ViboraHotspotJWLJ2'])
+  self.assertNotIn('source',documented[0])
+  self.assertEqual(engine.brief_capabilities(self.caps),[{'id':'h'*32,'summary':'hotspot JWL with J2','objects':['ViboraHotspotJWLJ2']},{'id':'n'*32,'summary':'neo-Hookean','objects':['NeoHooke']}])
+ def test_planning_and_review_prompts_carry_the_needed_interface(self):
+  e=FakeEngine();prompts=[];rpc=e.rpc
+  answers=[{'objects':['ViboraHotspotJWLJ2'],'questions':[]},
+           {'status':'needs_clarification','summary':'s','rationale':'','objects':['ViboraHotspotJWLJ2'],'questions':['Which interface?'],'input':''},
+           {'status':'needs_clarification','summary':'s','rationale':'','objects':['ViboraHotspotJWLJ2'],'questions':['Which interface?'],'input':''}]
+  e.llm=lambda model,prompt,schema:prompts.append(prompt) or answers.pop(0)
+  def fake(payload,timeout=220):
+   if payload['op']=='context':return {'object_paths':[],'relevant_objects':[],'capabilities':self.caps}
+   if payload['op']=='details':return []
+   return rpc(payload,timeout)
+  e.rpc=fake;j=e.jobs[e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'}})['id']];e.plan(j)
+  self.assertNotIn('detonation_velocity',prompts[0]);self.assertIn('detonation_velocity',prompts[1]);self.assertIn('detonation_velocity',prompts[2])
+  self.assertNotIn('NEO_SOURCE',prompts[1]+prompts[2])
+  self.assertTrue(any('does not document: ViboraHotspotJWLJ2' in x['message'] for x in j['log']))
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[
@@ -690,6 +714,16 @@ class WorkspaceTests(unittest.TestCase):
   workspace.run_submit(self.jid,text,2,'')
   script=(workspace.jobdir(self.jid)/'run/run.sbatch').read_text()
   self.assertIn('-i model.i Outputs/csv=true > moose.log',script);self.assertNotIn('Outputs/exodus',script)
+
+ def test_catalog_comes_from_the_active_app_and_refreshes_after_rebuild(self):
+  exe=workspace.ROOT/'vibora_physics-opt'
+  def build(kind):
+   exe.write_text('#!/bin/bash\necho \'**START JSON DATA**{"blocks":{"Materials":{"star":{"subblock_types":{"%s":{"description":"d","parameters":{"p":{}}}}}}}}**END JSON DATA**\'\n'%kind);exe.chmod(0o755)
+  build('ViboraHotspotJWLJ2');workspace.save(workspace.STATE/'active_app.json',{'executable':str(exe)})
+  self.assertIn('ViboraHotspotJWLJ2',workspace.catalog())
+  self.assertTrue(all(f.name.startswith('vibora_physics-opt-') for f in (workspace.STATE/'catalog').glob('*.json')))
+  build('ViboraHotspotJWLJ2Plus');os.utime(exe,(1,1))
+  self.assertIn('ViboraHotspotJWLJ2Plus',workspace.catalog())
  def test_no_approval_no_staging(self):
   with self.assertRaises(ValueError):workspace.stage(self.jid,{'files':[],'tests':[]})
   self.assertFalse((workspace.jobdir(self.jid)/'app').exists())

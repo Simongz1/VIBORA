@@ -92,8 +92,15 @@ def brief_objects(details,names=None):
           for k,p in d.get('parameters',{}).items() if k not in BOILERPLATE}
   brief.append({'path':d['path'],'description':str(d.get('description',''))[:400],'parameters':params})
  return brief if brief or wanted is None else brief_objects(details)
-def brief_capabilities(capabilities):
- return [{k:c[k] for k in ('id','summary','objects') if k in c} for c in capabilities or []]
+def brief_capabilities(capabilities,wanted=(),documented=()):
+ # Summaries only, plus source for retained objects the model needs but the catalog does not document.
+ wanted={str(n).rsplit('/',1)[-1] for n in wanted};documented={str(n).rsplit('/',1)[-1] for n in documented};out=[]
+ for c in capabilities or []:
+  entry={k:c[k] for k in ('id','summary','objects') if k in c}
+  needed={str(o).rsplit('/',1)[-1] for o in c.get('objects',[])}&wanted
+  if needed-documented and c.get('source'):entry['source']=c['source']
+  out.append(entry)
+ return out
 def diagnostics(check):
  # MOOSE output reduced to the lines that explain a failure, plus the end of the log.
  text=str(check.get('stdout',''))+'\n'+str(check.get('stderr',''))
@@ -473,7 +480,10 @@ class Engine:
   self.update(j,status='planning',summary='Designing the MOOSE input from registered object definitions.')
   # Source code and full catalog stay in j['context'] for approved custom coding; planning gets brief documentation.
   j['context']={'objects':details,'retained_capabilities':context['capabilities'],'brief_objects':brief_objects(details)}
-  prompt=INSTRUCTIONS+'\nReturn a complete MOOSE input if feasible with existing objects. Otherwise return needs_custom with a concrete proposal, or needs_clarification with questions. No C++ files yet.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'objects':j['context']['brief_objects'],'retained_capabilities':brief_capabilities(context['capabilities']),'discovery_questions':discovery['questions']})
+  capabilities=brief_capabilities(context['capabilities'],discovery['objects'],[d['path'] for d in details])
+  with_source=[o for c in capabilities if 'source' in c for o in c.get('objects',[])]
+  if with_source:self.log(j,'Included the source of retained object(s) the catalog does not document: '+', '.join(map(str,with_source))+'.')
+  prompt=INSTRUCTIONS+'\nReturn a complete MOOSE input if feasible with existing objects. Otherwise return needs_custom with a concrete proposal, or needs_clarification with questions. No C++ files yet.\n'+json.dumps({'graph':j['graph'],'resolved_graph_evidence':evidence,'objects':j['context']['brief_objects'],'retained_capabilities':capabilities,'discovery_questions':discovery['questions']})
   plan=self.ask(j,'design the MOOSE input',prompt,PLAN)
   self.finish_plan(j,plan,prompt)
  def reuse(self,j):
@@ -518,7 +528,11 @@ class Engine:
    "Use model-level requirements to resolve overrides. Remove already-answered questions; regenerate "
    "the complete input if nothing is missing. Keep genuinely absent physical data as targeted questions, "
    "not a general setup questionnaire. Do not invent constants to avoid asking.\n"+
-   json.dumps({'provisional_plan':plan,'resolved_graph_evidence':graph_evidence(j['graph']),'objects':self.plan_objects(j,plan)}),PLAN)
+   json.dumps({'provisional_plan':plan,'resolved_graph_evidence':graph_evidence(j['graph']),'objects':self.plan_objects(j,plan),'retained_capabilities':self.plan_capabilities(j,plan)}),PLAN)
+ def plan_capabilities(self,j,plan):
+  # Retained objects the plan uses: summaries, with source only where the catalog lacks their parameters.
+  context=j.get('context') or {}
+  return brief_capabilities(context.get('retained_capabilities'),plan.get('objects') or [],[d['path'] for d in context.get('objects') or []])
  def plan_objects(self,j,plan):
   # Documentation only for the objects the plan uses; repairs and reviews never resend the whole planning prompt.
   return brief_objects((j.get('context') or {}).get('objects'),plan.get('objects'))
@@ -538,7 +552,7 @@ class Engine:
     self.update(j,status='ready',summary=plan['summary'],input=plan['input'],plan=plan,validation=check,verification='MOOSE --check-input passed; no full simulation was run.');return
    if attempt<2:
     plan=self.ask(j,'repair the input using the MOOSE diagnostics',INSTRUCTIONS+'\nThe previous MOOSE input failed validation. Return the complete repaired input; fix syntax and parameters without simplifying the physics.\n'
-     +json.dumps({'resolved_graph_evidence':graph_evidence(j['graph']),'objects':self.plan_objects(j,plan),'previous':plan,'diagnostics':diagnostics(check)}),PLAN)
+     +json.dumps({'resolved_graph_evidence':graph_evidence(j['graph']),'objects':self.plan_objects(j,plan),'retained_capabilities':self.plan_capabilities(j,plan),'previous':plan,'diagnostics':diagnostics(check)}),PLAN)
     if plan['status']!='builtin' or plan['questions']:
      plan=self.review_questions(j,plan,prompt)
     if plan['status']!='builtin' or plan['questions']:
