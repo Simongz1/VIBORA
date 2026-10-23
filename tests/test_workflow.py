@@ -399,6 +399,47 @@ class PromoteSyncTests(unittest.TestCase):
   self.assertTrue(r['sync_pending']);self.assertIn('uncommitted changes',r['sync_message']);self.assertEqual(r['sync']['dirty'],['M README.md'])
   self.assertEqual((workspace.ROOT/'README.md').read_text(),'local edit\n')
 
+class CustomRepairTests(unittest.TestCase):
+ def package(self):
+  return {'summary':'hotspot','objects':['ViboraHotspotMaterial'],'input':'[ICs] twice',
+          'files':[{'path':'src/materials/A.C','content':'a'},{'path':'include/materials/A.h','content':'h'}],
+          'tests':[{'name':'t','input':'x','checks':[{'column':'v','expected':1,'tolerance':0.1}]}]}
+ def engine(self,repairs,results):
+  e=FakeEngine();j={'id':'d'*32,'status':'coding','model':{},'coding_prompt':'code it','package':self.package(),'summary':''}
+  staged=[];queue=list(results);rpc=e.rpc
+  def fake(payload,timeout=220):
+   op=payload['op']
+   if op=='stage':
+    if not payload['package']['files'] or not payload['package']['tests']:raise RuntimeError('Custom code requires source files and executable quantitative tests')
+    staged.append(copy.deepcopy(payload['package']));return {}
+   if op=='submit':return {'scheduler_id':'local','status':'running'}
+   if op=='build_status':return queue.pop(0)
+   if op=='promote':return {'retained':True,'capability':'d'*32}
+   return rpc(payload,timeout)
+  e.rpc=fake;answers=list(repairs);e.llm=lambda *a:answers.pop(0)
+  return e,j,staged
+ failed_check={'status':'complete','result':{'passed':False,'phase':'input_check','validation':{'stderr':'*** ERROR ***\nThe initial condition is being defined twice'}}}
+ passed={'status':'complete','result':{'passed':True,'phase':'tests','tests':[{'passed':True}]}}
+ def test_input_only_repair_keeps_source_files_and_tests(self):
+  e,j,staged=self.engine([{'summary':'','objects':[],'input':'[ICs] once','files':[],'tests':[]}],[self.failed_check,self.passed])
+  e.monitor(j)
+  self.assertEqual(j['status'],'ready');self.assertEqual(len(staged),1)
+  self.assertEqual([f['path'] for f in staged[0]['files']],['src/materials/A.C','include/materials/A.h'])
+  self.assertEqual((staged[0]['input'],len(staged[0]['tests']),staged[0]['summary']),('[ICs] once',1,'hotspot'))
+ def test_repair_replaces_changed_files_by_path(self):
+  e,j,staged=self.engine([{'summary':'fixed','objects':[],'input':'','files':[{'path':'src/materials/A.C','content':'a2'},{'path':'include/materials/A.h','content':''}],'tests':[]}],[self.failed_check,self.passed])
+  e.monitor(j)
+  self.assertEqual(staged[0]['files'],[{'path':'src/materials/A.C','content':'a2'}]);self.assertEqual(staged[0]['input'],'[ICs] twice')
+ def test_unbuildable_package_fails_with_clear_reason(self):
+  e,j,staged=self.engine([],[])
+  j['package']['tests']=[];e.submit_package(j)
+  self.assertEqual(j['status'],'failed');self.assertIn('cannot be built',j['error']);self.assertIn('0 test(s)',j['error'])
+ def test_repair_prompt_asks_for_complete_package(self):
+  prompts=[];e,j,staged=self.engine([],[self.failed_check,self.passed])
+  e.llm=lambda model,prompt,schema:prompts.append(prompt) or {'input':'[ICs] once','files':[],'tests':[]}
+  e.monitor(j)
+  self.assertIn('every source file (unchanged ones too)',prompts[0]);self.assertIn('initial condition is being defined twice',prompts[0])
+
 class InferenceTests(unittest.TestCase):
  def setup_graph(self):
   return {'request':'Run for 10 seconds with dt=0.1', 'nodes':[

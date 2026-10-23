@@ -108,6 +108,19 @@ def build_failure(result):
  out['tests']=[dict(t,log=cut(t.get('log'))) for t in result.get('tests') or []]
  return out
 
+def merge_package(previous,repaired):
+ # A repair may return only what it changed; keep the rest of the approved package.
+ # Files are matched by path; returning a file with empty content removes it.
+ files={f['path']:f for f in previous.get('files') or []}
+ for f in repaired.get('files') or []:
+  if not f.get('path'):continue
+  if f.get('content'):files[f['path']]=f
+  else:files.pop(f['path'],None)
+ return {'summary':repaired.get('summary') or previous.get('summary',''),'objects':repaired.get('objects') or previous.get('objects',[]),
+         'input':repaired.get('input') or previous.get('input',''),'files':list(files.values()),'tests':repaired.get('tests') or previous.get('tests',[])}
+def build_place(scheduler_id):
+ return 'on the MOOSE host' if scheduler_id=='local' else 'as Slurm job '+str(scheduler_id)
+
 def tokens(n):return ('%.1fk'%(n/1000)) if n>=1000 else str(n)
 def usage_text(u):
  # Token counts as reported by the provider; Codex only reports a combined total.
@@ -570,11 +583,19 @@ a sufficient test. Tests run serially with a 120-second limit each.
   package=self.ask(j,'write the custom C++ implementation and numerical tests',prompt,PACKAGE)
   j['package']=package;j['coding_prompt']=prompt;j['repair_count']=0
   self.submit_package(j)
- def submit_package(self,j):
-  self.rpc({'op':'stage','id':j['id'],'package':j['package']})
+ def stage_and_submit(self,j):
+  # Returns the build job id, or None after marking the job failed with the reason.
+  try:self.rpc({'op':'stage','id':j['id'],'package':j['package']})
+  except Exception as e:
+   self.update(j,status='failed',error='The coding model returned a package that cannot be built: '+str(e)+' ('+str(len(j['package'].get('files') or []))+' source file(s), '+str(len(j['package'].get('tests') or []))+' test(s)). Nothing was promoted.')
+   return None
   result=self.rpc({'op':'submit','id':j['id']})
-  self.log(j,'Staged '+str(len(j['package']['files']))+' source file(s); compile-and-test job submitted to Slurm as '+str(result['scheduler_id'])+'.')
-  self.update(j,status='queued',summary='Source staged; waiting for the scheduler to compile and test.',scheduler_id=result['scheduler_id'],files=[f['path'] for f in j['package']['files']])
+  self.log(j,'Staged '+str(len(j['package']['files']))+' source file(s) and '+str(len(j['package']['tests']))+' test(s); compile-and-test job started '+build_place(result['scheduler_id'])+'.')
+  return result['scheduler_id']
+ def submit_package(self,j):
+  sid=self.stage_and_submit(j)
+  if sid is None:return
+  self.update(j,status='queued',summary='Source staged; waiting to compile and test.',scheduler_id=sid,files=[f['path'] for f in j['package']['files']])
   self.monitor(j)
  def monitor(self,j):
   while True:
@@ -582,7 +603,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
    if state['status']=='complete':
     result=state['result']
     tests=result.get('tests') or []
-    self.log(j,'Slurm job finished at the '+str(result.get('phase','?'))+' phase: '+str(sum(t['passed'] for t in tests))+' of '+str(len(tests))+' numerical test(s) passed.')
+    self.log(j,'Build and test job finished at the '+str(result.get('phase','?'))+' phase: '+str(sum(t['passed'] for t in tests))+' of '+str(len(tests))+' numerical test(s) passed.')
     if result.get('passed'):
      self.update(j,status='retaining',summary='Build and numerical tests passed. Retaining the new capability.',test_result=result)
      retained=self.rpc({'op':'promote','id':j['id']},timeout=300)
@@ -592,11 +613,14 @@ a sufficient test. Tests run serially with a 120-second limit each.
      return
     if j.get('repair_count',0)<2:
      self.update(j,status='coding',summary='Build or test failed. Repairing the approved implementation.',test_result=result)
-     j['package']=self.ask(j,'repair the implementation after the failed build or tests',j['coding_prompt']+'\nRepair the implementation without weakening tests or changing requested physics.\n'+json.dumps({'previous':j['package'],'failure':build_failure(result)}),PACKAGE)
+     repaired=self.ask(j,'repair the implementation after the failed '+str(result.get('phase','build'))+' step',j['coding_prompt']+'\nRepair the implementation without weakening tests or changing requested physics. '
+      'Return the complete package: every source file (unchanged ones too), all tests and the full input. '
+      'If the failure is in the input file, fix the input and keep the source and tests.\n'+json.dumps({'previous':j['package'],'failure':build_failure(result)}),PACKAGE)
+     j['package']=merge_package(j['package'],repaired)
      j['repair_count']=j.get('repair_count',0)+1
-     self.rpc({'op':'stage','id':j['id'],'package':j['package']})
-     queued=self.rpc({'op':'submit','id':j['id']})
-     self.update(j,status='queued',scheduler_id=queued['scheduler_id']);continue
+     sid=self.stage_and_submit(j)
+     if sid is None:return
+     self.update(j,status='queued',scheduler_id=sid,files=[f['path'] for f in j['package']['files']]);continue
     self.update(j,status='failed',error='Custom build/test failed after two repairs. Nothing was promoted.',test_result=result);return
    if state['status']=='failed':
     self.update(j,status='failed',error=state['error'],scheduler=state);return
