@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SSH JSON RPC for catalog discovery, isolated MOOSE builds and persistent capabilities."""
+"""JSON RPC (over SSH or locally) for catalog discovery, isolated MOOSE builds, runs and persistent capabilities."""
 import csv, fcntl, hashlib, json, math, os, re, shlex, shutil, subprocess, sys, time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
@@ -7,8 +7,21 @@ STATE=ROOT/'.vibora'
 STATE.mkdir(exist_ok=True)
 CONFIG=json.loads((ROOT/'config.example.json').read_text())
 if (ROOT/'config.local.json').exists():CONFIG.update(json.loads((ROOT/'config.local.json').read_text()))
-MOOSE=Path(CONFIG['moose_dir'])
-BASE=Path(CONFIG['moose_executable'])
+MOOSE=Path(CONFIG['moose_dir']).expanduser()
+BASE=Path(CONFIG['moose_executable']).expanduser()
+def scheduler():return CONFIG.get('scheduler') or {}
+def slurm_enabled():return bool(scheduler().get('enabled'))
+def slurm_args(time_limit,extra):
+ # Only settings that are filled in are passed, so sites without accounts, QoS or GPUs need no edits.
+ cfg=scheduler();args=['sbatch','--parsable','--time',time_limit]
+ for key,flag in (('account','--account'),('partition','--partition'),('qos','--qos'),('memory','--mem')):
+  if cfg.get(key):args+=[flag,str(cfg[key])]
+ if int(cfg.get('gpus') or 0)>0:args+=['--gres','gpu:'+str(cfg['gpus'])]
+ return args+[str(a) for a in cfg.get('extra_args',[])]+[str(a) for a in extra]
+def local_limits():
+ # Runs started directly on this machine (a workstation or a cluster login node) stay small.
+ cfg=CONFIG.get('local_runs') or {}
+ return int(cfg.get('max_ranks',4)),cfg.get('max_time','01:00:00'),cfg.get('default_time','00:10:00')
 def run(args,cwd=None,timeout=120,env=None):
  p=subprocess.run([str(x) for x in args],cwd=cwd,text=True,capture_output=True,timeout=timeout,env=env)
  return {'returncode':p.returncode,'stdout':p.stdout[-60000:],'stderr':p.stderr[-10000:]}
@@ -24,8 +37,9 @@ def app_digest():
    h.update(str(p.relative_to(ROOT)).encode());h.update(p.read_bytes())
  return h.hexdigest()
 def catalog():
- path=STATE/'catalog'/'ml.json'
+ path=STATE/'catalog'/(BASE.name+'.json')
  if not path.exists():
+  if not BASE.exists():raise RuntimeError('MOOSE executable not found: '+str(BASE)+'. Set moose_executable in config.local.json (see docs/SETUP.md).')
   p=subprocess.run([str(BASE),'--json'],text=True,capture_output=True,timeout=180)
   text=p.stdout.split('**START JSON DATA**')[-1].split('**END JSON DATA**')[0]
   data=json.loads(text);path.parent.mkdir(exist_ok=True);save(path,data)
@@ -50,7 +64,7 @@ def context(request):
   capabilities.append({k:m[k] for k in ('id','summary','objects','files')})
   capabilities[-1]['source']=[{'path':f,'content':(ROOT/'moose_app'/f).read_text()} for f in m['files']]
  return {'object_paths':list(entries),'relevant_objects':[{'path':e['path'],'description':e['description'][:200]} for e in ranked[:150]],
-         'capabilities':capabilities,'application':'MARLINS (mlApp), all registered MOOSE modules','custom_application':'ViboraPhysicsApp',
+         'capabilities':capabilities,'application':CONFIG.get('application_description','MOOSE framework and physics modules'),'custom_application':'ViboraPhysicsApp',
          'source_digest':app_digest()}
 def details(paths):
  entries=catalog();result=[]
@@ -193,6 +207,9 @@ def build_test(jid):
  folder=jobdir(jid);package=json.loads((folder/'package.json').read_text());app=folder/'app'
  env=dict(os.environ,MOOSE_DIR=str(MOOSE),METHOD='opt',MOOSE_JOBS='2',OMP_NUM_THREADS='1')
  env['PATH']=os.pathsep.join(CONFIG.get('toolchain_bin',[])+[env.get('PATH','')])
+ # Optional base application linked into ViboraPhysicsApp (see moose_app/Makefile).
+ base=CONFIG.get('base_app') or {}
+ if base.get('class'):env.update(VIBORA_BASE_APP=base['class'],VIBORA_BASE_APP_DIR=str(Path(base['dir']).expanduser()),VIBORA_BASE_APP_LIB=base.get('library',''))
  result={'passed':False,'phase':'build'}
  try:
   build=run(['make','-j2'],cwd=app,timeout=900,env=env);result['build']=build
@@ -209,31 +226,41 @@ def build_test(jid):
  except Exception as e:result['error']=str(e);return result
  finally:save(folder/'build_result.json',result)
 def submit(jid):
- folder=jobdir(jid)
- if not (folder/'approval.json').exists():raise ValueError('No custom-code approval')
- cfg=CONFIG['scheduler']
+ if not (jobdir(jid)/'approval.json').exists():raise ValueError('No custom-code approval')
+ return start_build(jid)
+def start_build(jid):
+ # Compile and test through Slurm when enabled, otherwise as a background process on this machine.
+ folder=jobdir(jid);build=[sys.executable,str(ROOT/'scripts'/'moose_workspace.py'),'--build',jid]
+ if not slurm_enabled():
+  with (folder/'scheduler.log').open('w') as log:
+   p=subprocess.Popen(build,cwd=ROOT,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+  save(folder/'scheduler.json',{'mode':'local','pid':p.pid,'node':os.uname().nodename})
+  return {'scheduler_id':'local','status':'running'}
  script=folder/'build.sbatch'
- script.write_text('#!/bin/bash\nset -euo pipefail\ncd '+str(ROOT)+'\npython3 scripts/moose_workspace.py --build '+jid+'\n')
- args=['sbatch','--parsable','--account',cfg['account'],'--partition',cfg['partition'],'--qos',cfg['qos'],
-       '--gres','gpu:'+str(cfg.get('gpus',1)),'--time',cfg['time'],'--cpus-per-task',str(cfg['cpus']),'--mem',cfg['memory'],'--output',str(folder/'scheduler.log'),str(script)]
- r=run(args,timeout=30)
+ script.write_text('#!/bin/bash\nset -euo pipefail\ncd '+shlex.quote(str(ROOT))+'\n'+' '.join(shlex.quote(a) for a in build)+'\n')
+ r=run(slurm_args(scheduler().get('time','00:20:00'),['--cpus-per-task',scheduler().get('cpus',2),'--output',folder/'scheduler.log',script]),timeout=30)
  if r['returncode']!=0:raise RuntimeError(r['stderr'] or r['stdout'])
  scheduler_id=r['stdout'].strip().split(';')[0]
  if not scheduler_id.isdigit():raise RuntimeError('Invalid scheduler response')
- save(folder/'scheduler.json',{'id':scheduler_id});return {'scheduler_id':scheduler_id,'status':'queued'}
+ save(folder/'scheduler.json',{'mode':'slurm','id':scheduler_id});return {'scheduler_id':scheduler_id,'status':'queued'}
 def build_status(jid):
  folder=jobdir(jid)
  if (folder/'build_result.json').exists():return {'status':'complete','result':json.loads((folder/'build_result.json').read_text())}
  if not (folder/'scheduler.json').exists():return {'status':'not_submitted'}
- sid=json.loads((folder/'scheduler.json').read_text())['id']
+ meta=json.loads((folder/'scheduler.json').read_text())
+ if meta.get('mode')=='local':
+  try:os.kill(meta['pid'],0);alive=meta.get('node')==os.uname().nodename
+  except OSError:alive=False
+  if alive:return {'status':'running','scheduler':'local process '+str(meta['pid']),'scheduler_id':'local'}
+  log=(folder/'scheduler.log').read_text(errors='replace')[-8000:] if (folder/'scheduler.log').exists() else ''
+  return {'status':'failed','error':'The local build process ended without a build result.','log':log,'scheduler_id':'local'}
+ sid=meta['id']
  r=run(['squeue','-h','-j',sid,'-o','%T|%R'],timeout=20)
  state=r['stdout'].strip()
  if state:return {'status':'running' if state.startswith('RUNNING') else 'queued','scheduler':state,'scheduler_id':sid}
  log=(folder/'scheduler.log').read_text()[-8000:] if (folder/'scheduler.log').exists() else ''
  return {'status':'failed','error':'Scheduler job ended without a build result.','log':log,'scheduler_id':sid}
-RUN_FILES={'visualize.json','model.i','run.sbatch','run.sh','scheduler.json','exit_code','node','slurm.log','heartbeat','cancel','launcher.log','render.log'}
-LOGIN_MAX_RANKS=4
-LOGIN_MAX_SECONDS=3600
+RUN_FILES={'visualize.json','model.i','run.sbatch','run.sh','scheduler.json','exit_code','node','slurm.log','heartbeat','cancel','timed_out','launcher.log','render.log'}
 def run_results(folder):
  result={'folder':str(folder),'outputs':[],'postprocessors':{}}
  if (folder/'node').exists():result['node']=(folder/'node').read_text().strip()
@@ -252,7 +279,7 @@ def run_results(folder):
   if m.get('deformed'):result['images_deformed']=True
   if m.get('missing'):result['images_missing']=m['missing'];result['images_available']=m.get('available',[])
  return result
-CONDA_BASES=('miniforge3','mambaforge','miniconda3','anaconda3')
+CONDA_BASES=('miniforge','miniforge3','mambaforge','miniconda3','anaconda3')
 def conda_env_prefix(name):
  # Folder of the named conda environment: explicit setting, the usual install folders, then conda's own list.
  if CONFIG.get('render_conda_prefix'):return Path(CONFIG['render_conda_prefix']).expanduser()
@@ -290,12 +317,14 @@ def run_submit(jid,text,ranks,wall,where='slurm'):
  if (folder/'scheduler.json').exists() and run_status(jid)['status'] in ('queued','running'):raise ValueError('A simulation for this job is already queued or running')
  if folder.exists():shutil.rmtree(folder)
  folder.mkdir()
- cfg=CONFIG['scheduler']
+ cfg=scheduler()
  if where=='login':
-  ranks=int(ranks) or 1;wall=wall or '00:10:00'
-  if not 1<=ranks<=LOGIN_MAX_RANKS:raise ValueError('Login-node runs are limited to '+str(LOGIN_MAX_RANKS)+' MPI ranks')
-  if seconds(wall)>LOGIN_MAX_SECONDS:raise ValueError('Login-node runs are limited to 01:00:00 wall time')
- else:ranks=int(ranks) or int(cfg.get('run_ranks',cfg['cpus']));wall=wall or cfg.get('run_time',cfg['time'])
+  max_ranks,max_time,default_time=local_limits();ranks=int(ranks) or 1;wall=wall or default_time
+  if not 1<=ranks<=max_ranks:raise ValueError('Runs on this machine are limited to '+str(max_ranks)+' MPI ranks (local_runs.max_ranks)')
+  if seconds(wall)>seconds(max_time):raise ValueError('Runs on this machine are limited to '+max_time+' wall time (local_runs.max_time)')
+ else:
+  if not slurm_enabled():raise ValueError('Slurm is not enabled (scheduler.enabled in config.local.json); run on this machine instead')
+  ranks=int(ranks) or int(cfg.get('run_ranks',2));wall=wall or cfg.get('run_time','00:30:00')
  (folder/'model.i').write_text(text)
  # The solver's visualize list tells render_results.py which Exodus fields to show.
  save(folder/'visualize.json',{'names':visualize_list(state.get('graph'))})
@@ -308,11 +337,13 @@ def run_submit(jid,text,ranks,wall,where='slurm'):
  render=render_command()
  if where=='login':
   # Status checks may reach a different login node, so all state lives in files on the shared filesystem:
-  # a heartbeat while running, a cancel flag the loop obeys, and the exit code at the end.
+  # a heartbeat while running, a cancel flag the loop obeys, a timed_out marker and the exit code at the end.
+  # The wall-time limit is enforced here rather than with GNU timeout, which macOS lacks.
   script=folder/'run.sh'
-  script.write_text(head+'timeout --signal=TERM '+str(seconds(wall))+' '+moose+' &\nchild=$!\n'
-   +'watch(){ while kill -0 "$1" 2>/dev/null; do touch heartbeat; [ -f cancel ] && kill -TERM "$1"; sleep 5; done; }\n'
-   +'watch "$child"; wait "$child"; code=$?\n'
+  script.write_text(head+'start=$(date +%s)\n'+moose+' &\nchild=$!\n'
+   +'watch(){ while kill -0 "$1" 2>/dev/null; do touch heartbeat; [ -f cancel ] && kill -TERM "$1"\n'
+   +'  if [ -n "${2:-}" ] && [ $(( $(date +%s) - start )) -ge "$2" ]; then touch timed_out; kill -TERM "$1"; fi; sleep 5; done; }\n'
+   +'watch "$child" '+str(seconds(wall))+'; wait "$child"; code=$?\n'
    +'if [ ! -f cancel ]; then '+render+' & child=$!; watch "$child"; wait "$child"; fi\n'
    +'echo $code > exit_code\n')
   with (folder/'launcher.log').open('w') as log:
@@ -322,10 +353,7 @@ def run_submit(jid,text,ranks,wall,where='slurm'):
   return {'mode':'login','scheduler_id':None,'node':node,'ranks':ranks,'time':wall,'folder':str(folder)}
  script=folder/'run.sbatch'
  script.write_text(head+moose+'\ncode=$?\n'+render+' || true\necho $code > exit_code\n')
- args=['sbatch','--parsable','--job-name','vibora-run-'+jid[:8],'--account',cfg['account'],'--partition',cfg['partition'],'--qos',cfg['qos'],
-       '--gres','gpu:'+str(cfg.get('gpus',1)),'--time',wall,'--ntasks',str(ranks),'--cpus-per-task','1','--mem',cfg['memory'],
-       '--output',str(folder/'slurm.log'),str(script)]
- r=run(args,timeout=30)
+ r=run(slurm_args(wall,['--job-name','vibora-run-'+jid[:8],'--ntasks',ranks,'--cpus-per-task',1,'--output',folder/'slurm.log',script]),timeout=30)
  if r['returncode']!=0:raise RuntimeError(r['stderr'] or r['stdout'])
  sid=r['stdout'].strip().split(';')[0]
  if not sid.isdigit():raise RuntimeError('Invalid scheduler response')
@@ -340,14 +368,14 @@ def run_status(jid):
   code=int((folder/'exit_code').read_text().strip() or 1)
   result=dict(run_results(folder),returncode=code,scheduler_id=sid,mode=mode)
   if code and cancelled:return dict(result,status='cancelled')
-  if code==124 and mode=='login':return dict(result,status='failed',error='Login-node wall time limit ('+meta['time']+') reached.')
+  if code and mode=='login' and (folder/'timed_out').exists():return dict(result,status='failed',error='Wall time limit ('+meta['time']+') reached.')
   return dict(result,status='complete' if code==0 else 'failed')
  if mode=='login':
   beat=folder/'heartbeat';last=beat.stat().st_mtime if beat.exists() else meta['submitted_at']
   if time.time()-last<90:return {'status':'running','node':meta['node'],'mode':'login','scheduler_id':None}
   log=(folder/'launcher.log').read_text(errors='replace')[-4000:] if (folder/'launcher.log').exists() else ''
   return dict(run_results(folder),status='cancelled' if cancelled else 'failed',mode='login',scheduler_id=None,
-              error='The login-node process stopped without finishing (killed, or the node rebooted).',scheduler_log=log)
+              error='The run on this machine stopped without finishing (killed, or the machine rebooted).',scheduler_log=log)
  r=run(['squeue','-h','-j',sid,'-o','%T|%R|%N'],timeout=20)
  line=r['stdout'].strip()
  if line:
@@ -369,14 +397,14 @@ def git(*args,timeout=60):
 def sync_with_origin():
  # Put the new capability commit on top of GitHub before pushing, so both sides stay fast-forwardable.
  branch=git('rev-parse','--abbrev-ref','HEAD')['stdout'].strip()
- if not branch or branch=='HEAD':return {'pushed':False,'message':'The Gilbreth checkout is not on a branch; the capability commit stays local.'}
+ if not branch or branch=='HEAD':return {'pushed':False,'message':'The VIBORA checkout is not on a branch; the capability commit stays local.'}
  fetch=git('fetch','origin',branch)
  if fetch['returncode']!=0:return {'pushed':False,'message':'Could not fetch '+branch+' from GitHub: '+(fetch['stderr'] or fetch['stdout']).strip()[-300:]}
  upstream='origin/'+branch;before=git('rev-parse','HEAD')['stdout'].strip()
  pulled=[l for l in git('log','--format=%h %s','HEAD..'+upstream)['stdout'].splitlines() if l]
  if pulled:
   dirty=git('status','--porcelain','--untracked-files=no')['stdout'].strip()
-  if dirty:return {'pushed':False,'message':'GitHub has '+str(len(pulled))+' newer commit(s), but the Gilbreth checkout has uncommitted changes, so it was not rebased; the capability commit stays local.','dirty':dirty.splitlines()[:20]}
+  if dirty:return {'pushed':False,'message':'GitHub has '+str(len(pulled))+' newer commit(s), but the VIBORA checkout has uncommitted changes, so it was not rebased; the capability commit stays local.','dirty':dirty.splitlines()[:20]}
   rebase=git('rebase',upstream,timeout=120)
   if rebase['returncode']!=0:
    git('rebase','--abort')

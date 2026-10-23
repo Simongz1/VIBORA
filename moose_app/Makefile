@@ -54,10 +54,17 @@ XFEM                        := no
 include $(MOOSE_DIR)/modules/modules.mk
 ###############################################################################
 
-# Retain MARLINS objects alongside framework/module and VIBORA objects.
-MARLINS_DIR ?= /depot/aamp/data/gonz1075/moose/ml
-ADDITIONAL_INCLUDES += -I$(MARLINS_DIR)/include/base
-ADDITIONAL_LIBS += $(MARLINS_DIR)/lib/libml-$(METHOD).la
+# Optional base application whose objects are registered alongside the framework, modules and
+# VIBORA's own objects, for example your group's MOOSE application. VIBORA sets these from
+# base_app in config.local.json; leave them empty to use the framework and modules only.
+#   VIBORA_BASE_APP      class name, e.g. MyApp (header MyApp.h)
+#   VIBORA_BASE_APP_DIR  source tree containing include/base and lib/
+#   VIBORA_BASE_APP_LIB  library stem, e.g. my for lib/libmy-$(METHOD).la
+ifneq ($(VIBORA_BASE_APP),)
+  ADDITIONAL_INCLUDES += -I$(VIBORA_BASE_APP_DIR)/include/base
+  ADDITIONAL_LIBS     += $(VIBORA_BASE_APP_DIR)/lib/lib$(VIBORA_BASE_APP_LIB)-$(METHOD).la
+  ADDITIONAL_CPPFLAGS += -DVIBORA_BASE_APP=$(VIBORA_BASE_APP) -DVIBORA_BASE_APP_HEADER="\"$(VIBORA_BASE_APP).h\""
+endif
 
 # dep apps
 APPLICATION_DIR    := $(CURDIR)

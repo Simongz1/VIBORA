@@ -29,7 +29,7 @@ class WorkflowTests(unittest.TestCase):
  def test_selected_model_persisted(self):
   e=FakeEngine();j=e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'}})
   self.assertEqual(j['model']['id'],'test-model');self.assertEqual(e.launched,['plan'])
- def test_start_returns_without_waiting_on_gilbreth(self):
+ def test_start_returns_without_waiting_on_the_moose_host(self):
   e=FakeEngine();j=e.start({'graph':graph(),'model':{'provider':'local','id':'test-model'}})
   self.assertEqual(e.operations,[]);self.assertEqual(j['log'][0]['message'][:11],'Job created')
  def test_model_list_cached_and_refreshed_for_new_models(self):
@@ -188,8 +188,9 @@ class SimulationRunTests(unittest.TestCase):
   self.assertEqual(j['run']['status'],'queued');self.assertIn('monitor_run',e.launched)
   with self.assertRaises(ValueError):e.run({'id':j['id']})
 
- def test_login_runs_capped_at_four_ranks_and_one_hour(self):
-  for request in ({'ranks':5},{'time':'01:30:00'},{'where':'gpu-cluster'}):
+ def test_invalid_run_requests_rejected_before_submission(self):
+  # Machine-local limits come from local_runs in the config and are enforced by the workspace; the engine checks the rest.
+  for request in ({'ranks':500},{'time':'1 hour'},{'where':'gpu-cluster'}):
    e,j=self.ready()
    with self.assertRaises(ValueError):e.run(dict({'where':'login'},**request,id=j['id']))
    self.assertFalse(any(c['op']=='run_submit' for c in e.calls))
@@ -197,15 +198,15 @@ class SimulationRunTests(unittest.TestCase):
   e,j=self.ready();rpc=e.rpc
   e.rpc=lambda p,timeout=220:{'mode':'login','scheduler_id':None,'node':'login03','ranks':4,'time':'00:10:00','folder':'/r/run'} if p['op']=='run_submit' else rpc(p,timeout)
   e.run({'id':j['id'],'where':'login','ranks':4})
-  self.assertEqual(j['run']['status'],'running');self.assertIn('login node login03',j['log'][-1]['message'])
+  self.assertEqual(j['run']['status'],'running');self.assertIn('started on login03',j['log'][-1]['message'])
  def test_monitor_reports_completion_without_changing_job_status(self):
-  done={'status':'complete','node':'gilbreth-k001','outputs':[{'name':'model_out.csv','size':10}],'folder':'/r/run','postprocessors':{'avg':'1'}}
-  e,j=self.ready([{'status':'running','node':'gilbreth-k001'},done])
+  done={'status':'complete','node':'node001','outputs':[{'name':'model_out.csv','size':10}],'folder':'/r/run','postprocessors':{'avg':'1'}}
+  e,j=self.ready([{'status':'running','node':'node001'},done])
   e.run({'id':j['id']})
   original=engine.time.sleep;engine.time.sleep=lambda s:None;self.addCleanup(setattr,engine.time,'sleep',original)
   e.monitor_run(j)
   self.assertEqual(j['run']['status'],'complete');self.assertEqual(j['status'],'ready')
-  self.assertTrue(any('running on gilbreth-k001' in x['message'] for x in j['log']))
+  self.assertTrue(any('running on node001' in x['message'] for x in j['log']))
  def test_lost_scheduler_marks_only_the_run_failed(self):
   e,j=self.ready();e.run({'id':j['id']})
   def broken(payload,timeout=220):raise RuntimeError('ssh dropped')
@@ -343,14 +344,14 @@ class OutputEditTests(unittest.TestCase):
   self.assertIn('never write visualize itself into the input',engine.INSTRUCTIONS)
 
 class PromoteSyncTests(unittest.TestCase):
- """promote() with real git repositories: a bare origin, the Gilbreth checkout, and a laptop clone."""
+ """promote() with real git repositories: a bare origin, the MOOSE host checkout, and a laptop clone."""
  def git(self,cwd,*args):
   return subprocess.run(['git','-c','user.name=T','-c','user.email=t@t','-c','init.defaultBranch=main']+list(args),cwd=cwd,check=True,capture_output=True,text=True).stdout.strip()
  def setUp(self):
   self.tmp=tempfile.TemporaryDirectory();base=Path(self.tmp.name)
   self.old=(workspace.ROOT,workspace.STATE)
   self.origin=base/'origin.git';self.git(base,'init','--bare','-b','main',str(self.origin))
-  root=base/'gilbreth';self.git(base,'clone',str(self.origin),str(root))
+  root=base/'moose-host';self.git(base,'clone',str(self.origin),str(root))
   (root/'moose_app/src/base').mkdir(parents=True);(root/'moose_app/src/base/App.C').write_text('base')
   (root/'README.md').write_text('readme\n');(root/'.gitignore').write_text('.vibora/\n')
   self.git(root,'add','.');self.git(root,'commit','-m','initial');self.git(root,'push','origin','main')
@@ -488,12 +489,17 @@ class InferenceTests(unittest.TestCase):
 
 class WorkspaceTests(unittest.TestCase):
  def setUp(self):
-  self.tmp=tempfile.TemporaryDirectory();self.old=(workspace.ROOT,workspace.STATE)
+  self.tmp=tempfile.TemporaryDirectory();self.old=(workspace.ROOT,workspace.STATE,workspace.MOOSE,dict(workspace.CONFIG))
+  # Registered first, so it runs after every other cleanup (cleanups run last-in, first-out, after tearDown).
+  config=dict(workspace.CONFIG);self.addCleanup(lambda:(workspace.CONFIG.clear(),workspace.CONFIG.update(config)))
   workspace.ROOT=Path(self.tmp.name);workspace.STATE=workspace.ROOT/'.vibora';workspace.STATE.mkdir()
+  # Keep the real home folder (and any real conda environments next to MOOSE) out of these tests.
+  workspace.MOOSE=workspace.ROOT/'src'/'moose'
+  workspace.CONFIG['scheduler']={'enabled':True,'account':'acct','partition':'cpu','qos':'','memory':'8G','gpus':0}
   (workspace.ROOT/'moose_app/src/base').mkdir(parents=True);(workspace.ROOT/'moose_app/src/base/App.C').write_text('base')
   self.jid='a'*32
  def tearDown(self):
-  workspace.ROOT,workspace.STATE=self.old;self.tmp.cleanup()
+  workspace.ROOT,workspace.STATE,workspace.MOOSE=self.old[:3];self.tmp.cleanup()
  def test_run_submit_requires_ready_state_and_exact_input(self):
   workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'good'})
   with self.assertRaises(ValueError):workspace.run_submit(self.jid,'tampered',1,'')
@@ -512,11 +518,11 @@ class WorkspaceTests(unittest.TestCase):
   self.assertIn('mpiexec -n 3',(folder/'run.sbatch').read_text())
  def test_finished_run_reports_final_csv_values(self):
   folder=workspace.jobdir(self.jid)/'run';folder.mkdir()
-  workspace.save(folder/'scheduler.json',{'id':'7'});(folder/'exit_code').write_text('0\n');(folder/'node').write_text('gilbreth-k001\n')
+  workspace.save(folder/'scheduler.json',{'id':'7'});(folder/'exit_code').write_text('0\n');(folder/'node').write_text('node001\n')
   (folder/'model_out.csv').write_text('time,avg\n0,0\n1,2.5\n');(folder/'moose.log').write_text('Solve Converged!')
   status=workspace.run_status(self.jid)
   self.assertEqual(status['status'],'complete');self.assertEqual(status['postprocessors'],{'time':'1','avg':'2.5'})
-  self.assertEqual(status['node'],'gilbreth-k001');self.assertEqual([f['name'] for f in status['outputs']],['model_out.csv','moose.log'])
+  self.assertEqual(status['node'],'node001');self.assertEqual([f['name'] for f in status['outputs']],['model_out.csv','moose.log'])
  def test_cancelled_run_is_not_reported_as_failure(self):
   folder=workspace.jobdir(self.jid)/'run';folder.mkdir()
   workspace.save(folder/'scheduler.json',{'id':'7','cancelled':True});(folder/'exit_code').write_text('143')
@@ -635,6 +641,37 @@ class WorkspaceTests(unittest.TestCase):
   self.addCleanup(setattr,workspace,'run',original)
   workspace.run_submit(self.jid,'[Mesh]\n[]',2,'')
   self.assertEqual(json.loads((workspace.jobdir(self.jid)/'run/visualize.json').read_text()),{'names':['cauchy_stress_xx','temperature']})
+ def test_slurm_arguments_skip_empty_settings(self):
+  workspace.CONFIG['scheduler']={'enabled':True,'account':'','partition':'gpu','qos':'','memory':'','gpus':2,'extra_args':['--constraint=a100']}
+  args=workspace.slurm_args('00:05:00',['--ntasks',4])
+  self.assertEqual(args,['sbatch','--parsable','--time','00:05:00','--partition','gpu','--gres','gpu:2','--constraint=a100','--ntasks','4'])
+ def test_compute_node_runs_need_slurm_enabled(self):
+  workspace.CONFIG['scheduler']={'enabled':False}
+  workspace.save(workspace.jobdir(self.jid)/'state.json',{'status':'ready','input':'in'})
+  with self.assertRaises(ValueError) as e:workspace.run_submit(self.jid,'in',2,'','slurm')
+  self.assertIn('scheduler.enabled',str(e.exception))
+ def test_local_run_limits_come_from_config(self):
+  workspace.CONFIG['local_runs']={'max_ranks':8,'max_time':'00:30:00','default_time':'00:05:00'}
+  self.login_tools('true')
+  self.assertEqual(workspace.run_submit(self.jid,'[Mesh]\n[]',8,'','login')['time'],'00:05:00')
+  self.wait_for(('complete','failed'))
+  with self.assertRaises(ValueError):workspace.run_submit(self.jid,'[Mesh]\n[]',2,'00:45:00','login')
+ def test_local_run_wall_time_is_enforced_without_gnu_timeout(self):
+  self.login_tools('sleep 30')
+  workspace.run_submit(self.jid,'[Mesh]\n[]',1,'00:00:01','login')
+  status=self.wait_for(('failed','complete','cancelled'),limit=30)
+  self.assertEqual(status['status'],'failed');self.assertIn('Wall time limit',status['error'])
+ def test_builds_run_locally_without_slurm(self):
+  workspace.CONFIG['scheduler']={'enabled':False}
+  folder=workspace.jobdir(self.jid);workspace.save(folder/'approval.json',{'plan_hash':'x'})
+  started=[];original=workspace.subprocess.Popen
+  class Process:
+   pid=os.getpid()
+   def __init__(self,args,**kw):started.append(args)
+  workspace.subprocess.Popen=Process;self.addCleanup(setattr,workspace.subprocess,'Popen',original)
+  self.assertEqual(workspace.submit(self.jid),{'scheduler_id':'local','status':'running'})
+  self.assertEqual(started[0][-2:],['--build',self.jid]);self.assertEqual(workspace.build_status(self.jid)['status'],'running')
+  workspace.save(folder/'build_result.json',{'passed':True});self.assertEqual(workspace.build_status(self.jid)['status'],'complete')
  def test_output_overrides_only_for_missing_outputs(self):
   sub_block='[Outputs]\n  [exodus]\n    type = Exodus\n    time_step_interval = 2\n  []\n[]'
   self.assertEqual(workspace.output_overrides(sub_block),['Outputs/csv=true'])

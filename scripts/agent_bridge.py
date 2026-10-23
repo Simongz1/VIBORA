@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Run on the laptop with Codex login. Source may be streamed over SSH."""
+"""VIBORA bridge: runs where your LLM sign-ins live and serves the model calls for the GUI.
+
+Single machine (MOOSE installed here):  python3 scripts/agent_bridge.py
+Remote MOOSE host over SSH:             ssh HOST 'cat DIR/scripts/agent_bridge.py' | python3 -u - --ssh-host HOST --remote-dir DIR
+See docs/SETUP.md.
+"""
 import argparse
 import hmac
 import json
@@ -86,23 +91,30 @@ def resolve(graph, codex, timeout=240):
         return answer
 
 def main():
-    parser=argparse.ArgumentParser()
-    parser.add_argument("--port",type=int,default=18083)
-    parser.add_argument("--ssh-host")
-    parser.add_argument("--gui-port",type=int,default=18080)
-    parser.add_argument("--remote-dir",default="/depot/aamp/data/gonz1075/vibora")
-    parser.add_argument("--codex",default=shutil.which("codex") or "/opt/homebrew/bin/codex")
+    parser=argparse.ArgumentParser(description="Start the VIBORA GUI and its model bridge. Without --ssh-host everything runs on this machine.")
+    parser.add_argument("--port",type=int,default=18083,help="bridge port (default 18083)")
+    parser.add_argument("--ssh-host",help="MOOSE host reached over SSH, e.g. user@cluster.example.edu")
+    parser.add_argument("--gui-port",type=int,default=18080,help="GUI port (default 18080)")
+    parser.add_argument("--remote-dir",help="VIBORA checkout on the SSH host (required with --ssh-host); with no host, the local checkout")
+    parser.add_argument("--codex",default=shutil.which("codex") or "codex",help="Codex CLI path (default: found on PATH)")
     parser.add_argument("--claude",help="Claude Code CLI path (default: found on PATH)")
-    parser.add_argument("--token-file")
+    parser.add_argument("--token-file",help="use this token and an externally managed GUI server/tunnel instead of starting one")
     args=parser.parse_args()
-    if not args.token_file and not args.ssh_host:
-        parser.error("Provide --ssh-host to manage the tunnel, or --token-file for an external tunnel.")
+    args.ssh_host=args.ssh_host or os.environ.get('VIBORA_SSH_HOST') or None
+    if args.ssh_host and not args.remote_dir:parser.error("--remote-dir is required with --ssh-host (the VIBORA checkout on that host).")
+    if not args.ssh_host:
+        # Single machine: this checkout holds the engine, the GUI server and the MOOSE workspace.
+        here=Path(__file__).resolve().parents[1] if not __file__.startswith('<') else None
+        args.remote_dir=str(Path(args.remote_dir).expanduser().resolve()) if args.remote_dir else (str(here) if here else None)
+        if not args.remote_dir:parser.error("Run scripts/agent_bridge.py from the VIBORA checkout, or pass --remote-dir.")
     token=Path(args.token_file).read_text().strip() if args.token_file else secrets.token_hex(32)
-    host=args.ssh_host or os.environ.get('VIBORA_SSH_HOST','gonz1075@gilbreth.rcac.purdue.edu')
-    source=subprocess.run(['ssh','-o','BatchMode=yes',host,'cat '+shlex.quote(args.remote_dir+'/scripts/workflow_engine.py')],text=True,capture_output=True,timeout=30)
-    if source.returncode:raise RuntimeError('Cannot load MOOSE workflow engine: '+source.stderr)
+    if args.ssh_host:
+        source=subprocess.run(['ssh','-o','BatchMode=yes',args.ssh_host,'cat '+shlex.quote(args.remote_dir+'/scripts/workflow_engine.py')],text=True,capture_output=True,timeout=30)
+        if source.returncode:raise RuntimeError('Cannot load the VIBORA workflow engine from '+args.ssh_host+': '+source.stderr)
+        code=source.stdout
+    else:code=(Path(args.remote_dir)/'scripts'/'workflow_engine.py').read_text()
     module=types.ModuleType('vibora_workflow')
-    exec(compile(source.stdout,'workflow_engine.py','exec'),module.__dict__)
+    exec(compile(code,'workflow_engine.py','exec'),module.__dict__)
     engine=module.Engine(args)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args): pass
@@ -146,8 +158,16 @@ def main():
     server=ThreadingHTTPServer(("127.0.0.1",args.port),Handler)
     tunnel=None
     try:
-        if args.ssh_host:
-            # Stop this user's stale GUI servers for the port on this login node; each holds an old token.
+        if args.token_file:pass
+        elif not args.ssh_host:
+            # Local GUI server; it exits when this bridge closes its stdin.
+            binary=Path(args.remote_dir)/'build'/'vibora'
+            if not binary.exists():raise RuntimeError('GUI server not built: '+str(binary)+'. Build it with cmake (see docs/SETUP.md).')
+            tunnel=subprocess.Popen([str(binary),str(args.gui_port),'web'],cwd=args.remote_dir,stdin=subprocess.PIPE,
+                env=dict(os.environ,VIBORA_AGENT_TOKEN=token,VIBORA_AGENT_PORT=str(args.port),VIBORA_EXIT_ON_EOF='1'))
+            print("GUI: http://127.0.0.1:"+str(args.gui_port),flush=True)
+        else:
+            # Stop this user's stale GUI servers for the port on this host; each holds an old token.
             # The server exits when this SSH session ends, because the bridge keeps its stdin open.
             remote=("cd "+shlex.quote(args.remote_dir)+" && { pkill -u \"$(id -u)\" -f '^\\./build/vibora "+str(args.gui_port)+" web$' && sleep 1; }; "
                     "IFS= read -r VIBORA_AGENT_TOKEN && export VIBORA_AGENT_TOKEN && "
@@ -159,7 +179,7 @@ def main():
             print("GUI: http://127.0.0.1:"+str(args.gui_port),flush=True)
         server.timeout=1
         while tunnel is None or tunnel.poll() is None: server.handle_request()
-        raise RuntimeError("SSH tunnel stopped; check host authentication and port availability.")
+        raise RuntimeError("SSH tunnel stopped; check host authentication and port availability." if args.ssh_host else "The GUI server stopped; check that port "+str(args.gui_port)+" is free.")
     except KeyboardInterrupt:
         pass
     finally:

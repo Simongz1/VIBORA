@@ -56,7 +56,7 @@ function runText(run){
  const id=run.scheduler_id?' (Slurm job '+run.scheduler_id+')':'';
  if(run.status==='submitting')return 'Submitting to Slurm…';
  if(run.status==='queued')return 'Waiting for a compute node'+id+(run.reason?': '+run.reason:'')+'.';
- const where=run.mode==='login'?'login node ':'';
+ const where=run.mode==='login'?'this machine, ':'';
  if(run.status==='running')return 'Running on '+where+(run.node||'a compute node')+id+'.';
  if(run.status==='complete')return 'Finished on '+where+(run.node||'the compute node')+id+'.';
  if(run.status==='cancelled')return 'Cancelled'+id+'.';
@@ -69,7 +69,7 @@ function showRun(job){
  $('#cancel-run').hidden=!['queued','running'].includes(run.status);
  $('#run-status').textContent=runText(run);
  const details={};
- if(run.folder)details.results_folder_on_gilbreth=run.folder;
+ if(run.folder)details.results_folder=run.folder;
  if(run.postprocessors&&Object.keys(run.postprocessors).length)details['final_values ('+run.csv+', '+run.csv_rows+' rows)']=run.postprocessors;
  if(run.outputs?.length)details.output_files=run.outputs.map(f=>f.name+' ('+Math.max(1,Math.round(f.size/1024))+' kB)');
  if(run.scheduler_log)details.scheduler_log=run.scheduler_log;
@@ -169,16 +169,16 @@ $('#approve-custom').onclick=async()=>{
 $('#decline-custom').onclick=async()=>{try{showJob(await api('jobs/reject',{id:currentJob.id}));}catch(e){status(e.message);}};
 function updateRunWhere(again){
  const login=$('#run-where').value==='login';
- $('#run-ranks').max=login?4:128;$('#run-ranks').placeholder=login?'1 (max 4)':'Default';$('#run-time').placeholder=login?'00:10:00 (max 01:00:00)':'HH:MM:SS';
+ // Limits for this machine come from local_runs in the config and are checked by the MOOSE host.
+ $('#run-ranks').placeholder=login?'1 (quick test)':'Default';$('#run-time').placeholder=login?'00:10:00':'HH:MM:SS';
  if(again!==undefined)$('#start-run').dataset.again=again?'1':'';
- $('#start-run').textContent=($('#start-run').dataset.again?'Run again on ':'Run on ')+(login?'login node':'compute node');
+ $('#start-run').textContent=($('#start-run').dataset.again?'Run again on ':'Run on ')+(login?'this machine':'compute node');
 }
 $('#run-where').onchange=()=>updateRunWhere();
 $('#start-run').onclick=async()=>{
  if(!currentJob||currentJob.status!=='ready')return;
  const where=$('#run-where').value,ranks=Number($('#run-ranks').value)||0;
- if(where==='login'&&ranks>4){$('#run-status').textContent='Login-node runs are limited to 4 MPI ranks.';return;}
- $('#start-run').disabled=true;$('#run-status').textContent=where==='login'?'Starting on the login node…':'Submitting to Slurm…';
+  $('#start-run').disabled=true;$('#run-status').textContent=where==='login'?'Starting on this machine…':'Submitting to Slurm…';
  try{showJob(await api('jobs/run',{id:currentJob.id,where,ranks,time:$('#run-time').value.trim()}));}
  catch(e){$('#run-status').textContent=e.message;$('#start-run').disabled=false;}
 };

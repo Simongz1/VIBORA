@@ -61,6 +61,7 @@ function render(){
  if(document.activeElement!==$('#model-request'))$('#model-request').value=graph.request||'';
  const solver=graph.nodes.find(n=>n.kind==='solver');$('#model-title').textContent=graph.title||'MOOSE model assembly';
  $('#nodes').replaceChildren();$('#counts').textContent=graph.nodes.length+' blocks · '+graph.edges.length+' connections';
+ if(!graph.nodes.length){const hint=el('div',undefined,'empty-hint');hint.append(el('b','Start a model'),el('span','Add blocks from the library (or MOOSE objects with ＋ Add MOOSE object), connect their ports, and describe the physics. Open loads a saved graph.'));$('#nodes').append(hint);}
  for(const n of graph.nodes){
   const card=el('section',undefined,'node'+(selected===n.id?' selected':''));card.id=n.id;card.style.left=n.x+'px';card.style.top=n.y+'px';
   const head=el('div',undefined,'node-head');head.append(el('b',n.label),el('small',n.kind==='solver'?(n.params.type||'Steady')+' · '+(n.params.solve_type||'PJFNK'):(n.category||descriptions[n.kind][2])+(n.object_type?' · '+n.object_type:'')));card.append(head);
@@ -153,14 +154,6 @@ async function check(generate=false,quiet=false){
  }catch(e){status('Backend unavailable. Start the C++ server and reconnect.');if(!quiet)$('#issues').replaceChildren(el('p','Cannot reach the C++ backend.','issue'));}
  finally{if(generate){generationPending=false;$('#generate').disabled=false;}}
 }
-function example(){
- graph={version:1,nodes:[node('mesh',50,100),node('variable',290,100),node('diffusion',540,50),node('boundary',540,230,'Left · u = 0'),node('boundary',540,410,'Right · u = 1'),node('solver',800,150),node('output',1050,150)],edges:[]};
- graph.nodes[4].params={boundary:'right',value:1};
- const link=(a,out,b,input)=>graph.edges.push({from:graph.nodes[a].id,out,to:graph.nodes[b].id,in:input});
- link(0,'mesh',1,'mesh');link(1,'field',2,'field');link(1,'field',3,'field');link(1,'field',4,'field');
- link(2,'operator',5,'operator');link(3,'constraint',5,'constraint');link(4,'constraint',5,'constraint');link(5,'solution',6,'solution');
- selected=null;pending=null;$('#model-title').textContent='Steady diffusion / unit square';render();inspect();invalidate();
-}
 function download(name,text,type){const url=URL.createObjectURL(new Blob([text],{type}));const a=el('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 $('#validate').onclick=()=>check();$('#generate').onclick=()=>check(true);
 $('#save').onclick=()=>download('vibora.json',JSON.stringify(graph,null,2),'application/json');
@@ -182,7 +175,6 @@ $('#file').onchange=async e=>{
   graph=g;selected=null;pending=null;$('#model-title').textContent=file.name;render();inspect();invalidate();zoomToFit(true);
  }catch(err){status('Open failed: '+err.message);}finally{e.target.value='';}
 };
-$('#example').onclick=()=>{if(!graph.nodes.length||confirm('Replace the current graph with the diffusion example? Save first to keep your edits.'))example();};
 $('#custom').onclick=()=>$('#creator').showModal();
 $('#create').onclick=e=>{
  if(!$('#new-label').value.trim()){e.preventDefault();$('#new-label').focus();return;}
@@ -196,14 +188,15 @@ window.addEventListener('resize',drawWires);
 async function start(){
  try{
   const res=await fetch('/api/catalog');if(!res.ok)throw Error();catalog=await res.json();
-  for(const kind of ['component','mesh','variable','diffusion','boundary','solver','output']){
+  // General building blocks only; any MOOSE object is added as a component with its category.
+  for(const kind of ['component','mesh','solver','output']){
    const [symbol,title,desc]=descriptions[kind],b=el('button',undefined,'library-item'),label=el('div',title);label.append(el('small',desc));b.append(el('span',symbol,'symbol'),label);b.onclick=()=>add(kind);$('#catalog').append(b);
    const option=el('option',title);option.value=kind;$('#new-kind').append(option);
   }
   for(const category of mooseCategories){const option=el('option');option.value=category;$('#moose-categories').append(option);}
-  for(const category of ['Materials','ICs','BCs','Postprocessors','Kernels','AuxVariables','AuxKernels']){const b=el('button','＋ '+category,'library-item');b.onclick=()=>add('component',category,{category});$('#catalog').append(b);}
+  for(const category of ['Variables','Materials','ICs','BCs','Kernels','AuxVariables','AuxKernels','Postprocessors']){const b=el('button','＋ '+category,'library-item');b.onclick=()=>add('component',category,{category});$('#catalog').append(b);}
   const draft=localStorage.getItem('vibora-draft');
-  if(draft){try{const g=JSON.parse(draft);if(!Array.isArray(g.nodes)||!Array.isArray(g.edges)||g.nodes.some(n=>!spec(n.kind)))throw Error();graph=g;render();inspect();scheduleCheck();}catch(e){example();}}else example();
+  if(draft){try{const g=JSON.parse(draft);if(!Array.isArray(g.nodes)||!Array.isArray(g.edges)||g.nodes.some(n=>!spec(n.kind)))throw Error();graph=g;render();inspect();scheduleCheck();}catch(e){render();}}else render();
  }catch(e){status('Cannot load block catalog. Start the C++ backend.');}
 }
 start();

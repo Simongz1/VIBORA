@@ -1,24 +1,32 @@
 {
-  "moose_executable": "/depot/aamp/data/gonz1075/moose/ml/ml-opt",
-  "moose_dir": "/depot/aamp/data/gonz1075/moose/moose",
+  "moose_dir": "~/projects/moose",
+  "moose_executable": "~/projects/moose/modules/combined/combined-opt",
+  "application_description": "MOOSE framework and all physics modules (combined application)",
+  "base_app": {
+    "class": "",
+    "dir": "",
+    "library": ""
+  },
+  "toolchain_bin": [],
   "scheduler": {
-    "account": "alta",
-    "partition": "a30",
-    "qos": "standby",
+    "enabled": false,
+    "account": "",
+    "partition": "",
+    "qos": "",
+    "memory": "8G",
+    "gpus": 0,
+    "extra_args": [],
     "time": "00:20:00",
     "cpus": 2,
-    "memory": "8G",
-    "gpus": 1,
     "run_ranks": 2,
     "run_time": "00:30:00"
   },
-  "max_repairs": 2,
+  "local_runs": {
+    "max_ranks": 4,
+    "max_time": "01:00:00",
+    "default_time": "00:10:00"
+  },
   "render_conda_env": "moose",
   "render_conda_prefix": "",
-  "ollama_url": "http://127.0.0.1:11434",
-  "openai_compatible_url": "http://127.0.0.1:8000/v1",
-  "toolchain_bin": [
-    "/apps/spack/gilbreth-r9/apps/openmpi/4.1.6-gcc-11.5.0-w7wc45k/bin",
-    "/apps/spack/gilbreth-r9/apps/cuda/12.6.0-gcc-11.5.0-a7cv7sp/bin"
-  ]
+  "render_python": ""
 }

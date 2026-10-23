@@ -2,7 +2,9 @@
 #include "Moose.h"
 #include "AppFactory.h"
 #include "ModulesApp.h"
-#include "mlApp.h"
+#ifdef VIBORA_BASE_APP
+#include VIBORA_BASE_APP_HEADER
+#endif
 #include "MooseSyntax.h"
 
 InputParameters
@@ -24,7 +26,12 @@ ViboraPhysicsApp::~ViboraPhysicsApp() {}
 void
 ViboraPhysicsApp::registerAll(Factory & f, ActionFactory & af, Syntax & syntax)
 {
-  mlApp::registerAll(f, af, syntax);
+#ifdef VIBORA_BASE_APP
+  // A configured base application registers its own objects together with the framework and modules.
+  VIBORA_BASE_APP::registerAll(f, af, syntax);
+#else
+  ModulesApp::registerAllObjects<ViboraPhysicsApp>(f, af, syntax);
+#endif
   Registry::registerObjectsTo(f, {"ViboraPhysicsApp"});
   Registry::registerActionsTo(af, {"ViboraPhysicsApp"});
 

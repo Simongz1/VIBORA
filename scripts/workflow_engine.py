@@ -1,5 +1,5 @@
-"""Provider-neutral MOOSE coding jobs. Runs inside the authenticated laptop bridge."""
-import hashlib,json,os,re,shlex,shutil,subprocess,tempfile,threading,time,uuid
+"""Provider-neutral MOOSE coding jobs. Runs inside the bridge, next to your LLM sign-ins."""
+import hashlib,json,os,re,shlex,shutil,subprocess,sys,tempfile,threading,time,uuid
 from pathlib import Path
 from urllib.request import Request,urlopen
 from urllib.error import HTTPError,URLError
@@ -14,7 +14,7 @@ PACKAGE=obj({'summary':S,'objects':STRINGS,'input':S,
  'files':{'type':'array','items':obj({'path':S,'content':S})},
  'tests':{'type':'array','items':obj({'name':S,'input':S,'checks':{'type':'array','items':obj({'column':S,'expected':{'type':'number'},'tolerance':{'type':'number'}})}})}})
 INSTRUCTIONS="""You are VIBORA's MOOSE coding agent. Implement the user's block graph using
-the actual registered MOOSE/MARLINS objects and retained VIBORA capabilities supplied as context.
+the actual registered MOOSE objects and retained VIBORA capabilities supplied as context.
 There is NO diffusion-only restriction, fixed field count, fixed dimension or fixed physics list.
 Descriptions express desired physics; respect numerical methods, dimensions, inputs, outputs,
 units and interactions. Block kinds are hints, not a restriction on possible MOOSE syntax.
@@ -191,7 +191,7 @@ def claude_cli(args):
 def claude_client():
  # Imported lazily so Codex/local providers work without the SDK installed.
  try:import anthropic
- except ImportError:raise RuntimeError('Install the Anthropic SDK on the laptop: pip3 install --user anthropic')
+ except ImportError:raise RuntimeError('Install the Anthropic SDK for the bridge: python3 -m pip install --user anthropic')
  client=anthropic.Anthropic(timeout=900)
  if client.api_key is None and client.auth_token is None and getattr(client,'credentials',None) is None:
   raise RuntimeError('Set ANTHROPIC_API_KEY before starting the bridge')
@@ -274,11 +274,14 @@ class Engine:
   self.args=args;self.jobs={};self.lock=threading.RLock();self.active=set()
   # Token counts reported by the provider for the current thread's last model call.
   self.usage=threading.local()
-  self.host=args.ssh_host or os.environ.get('VIBORA_SSH_HOST','gonz1075@gilbreth.rcac.purdue.edu')
+  # No SSH host means MOOSE and the workspace live on this machine.
+  self.host=args.ssh_host or os.environ.get('VIBORA_SSH_HOST') or None
   self.remote=args.remote_dir
  def rpc(self,payload,timeout=220):
-  command='cd '+shlex.quote(self.remote)+' && python3 scripts/moose_workspace.py'
-  p=subprocess.run(['ssh','-o','BatchMode=yes',self.host,command],input=json.dumps(payload),text=True,capture_output=True,timeout=timeout)
+  if self.host:
+   command='cd '+shlex.quote(self.remote)+' && python3 scripts/moose_workspace.py'
+   p=subprocess.run(['ssh','-o','BatchMode=yes',self.host,command],input=json.dumps(payload),text=True,capture_output=True,timeout=timeout)
+  else:p=subprocess.run([sys.executable,'scripts/moose_workspace.py'],cwd=self.remote,input=json.dumps(payload),text=True,capture_output=True,timeout=timeout)
   try:r=json.loads(p.stdout)
   except ValueError:raise RuntimeError('Workspace request failed: '+p.stderr[-2000:])
   if not r.get('ok'):raise RuntimeError(r.get('error','Workspace request failed'))
@@ -340,7 +343,7 @@ class Engine:
   if provider=='anthropic':return self.claude(mid,prompt,schema)
   if provider=='claude-code':
    cli=claude_cli(self.args)
-   if not cli:raise RuntimeError('Claude Code CLI not found on the laptop.')
+   if not cli:raise RuntimeError('Claude Code CLI not found where the bridge runs.')
    # No tools, MCP servers or saved sessions: the CLI only answers with schema-validated JSON.
    cmd=[cli,'-p','--output-format','json','--json-schema',json.dumps(schema),'--tools','','--strict-mcp-config',
      '--no-session-persistence','--model',mid,'--effort','high',
@@ -374,7 +377,7 @@ class Engine:
    with client.beta.messages.stream(model=mid,max_tokens=64000,cache_control={'type':'ephemeral'},
      output_config={'effort':'high','format':{'type':'json_schema','schema':schema}},
      messages=[{'role':'user','content':prompt}],**options) as stream:message=stream.get_final_message()
-  except anthropic.AuthenticationError:raise RuntimeError('Claude API key rejected. Check ANTHROPIC_API_KEY on the laptop.')
+  except anthropic.AuthenticationError:raise RuntimeError('Claude API key rejected. Check ANTHROPIC_API_KEY where the bridge runs.')
   except anthropic.RateLimitError as e:raise RuntimeError('Claude API rate or spend limit reached; retry later or select another model: '+e.message)
   except anthropic.APIStatusError as e:raise RuntimeError('Selected Claude model failed ('+str(e.status_code)+'): '+e.message)
   except anthropic.APIConnectionError as e:raise RuntimeError('Cannot reach the Claude API: '+str(e))
@@ -419,7 +422,7 @@ class Engine:
  def persist(self,j):
   started=time.time()
   self.rpc({'op':'save_job','id':j['id'],'state':j})
-  if time.time()-started>5:self.log(j,'Saving the job state on Gilbreth took '+str(round(time.time()-started))+' s; SSH or /depot is slow.')
+  if time.time()-started>5:self.log(j,'Saving the job state on the MOOSE host took '+str(round(time.time()-started))+' s; SSH or the file system is slow.')
  def update(self,j,**values):
   with self.lock:
    if values.get('summary') and values['summary']!=j.get('summary'):self.log(j,values['summary'])
@@ -439,7 +442,7 @@ class Engine:
      'model':model,'summary':'Inspecting available MOOSE objects.','created_at':time.time()}
   with self.lock:self.jobs[jid]=j
   self.log(j,'Job created for '+str(model.get('provider'))+' / '+str(model.get('id'))+' with '+str(len(g.get('nodes',[])))+' blocks and '+str(len(g.get('edges',[])))+' connections.')
-  # Saving on Gilbreth happens in the job thread so the GUI gets the job, and its log, immediately.
+  # Saving on the MOOSE host happens in the job thread so the GUI gets the job, and its log, immediately.
   self.launch(j,self.plan)
   return self.public(j)
  def launch(self,j,fn):
@@ -455,7 +458,7 @@ class Engine:
  def plan(self,j):
   self.persist(j)
   if not j.get('force') and (self.reuse(j) or self.output_edit(j)):return
-  self.log(j,'Loading the MOOSE/MARLINS object catalog and retained capabilities from Gilbreth.')
+  self.log(j,'Loading the MOOSE object catalog and retained capabilities.')
   context=self.rpc({'op':'context','graph':j['graph']})
   self.log(j,'Catalog loaded: '+str(len(context.get('object_paths',[])))+' registered objects, '+str(len(context.get('capabilities',[])))+' retained VIBORA capabilities.')
   evidence=graph_evidence(j['graph']);j['evidence']=evidence
@@ -527,7 +530,7 @@ class Engine:
    self.update(j,status='awaiting_approval',summary=plan['summary'],rationale=plan['rationale'],plan=plan,plan_hash=digest(plan));return
   for attempt in range(3):
    self.update(j,status='checking',summary='Checking the proposed input with the installed MOOSE application.')
-   self.log(j,'Running MOOSE --check-input on Gilbreth (attempt '+str(attempt+1)+' of 3).')
+   self.log(j,'Running MOOSE --check-input (attempt '+str(attempt+1)+' of 3).')
    check=self.rpc({'op':'check','id':j['id'],'input':plan['input']})
    errors=[l.strip() for l in (check.get('stdout','')+'\n'+check.get('stderr','')).splitlines() if 'error' in l.lower()]
    self.log(j,'MOOSE input check passed.' if check.get('valid') else 'MOOSE input check failed'+(': '+errors[0][:300] if errors else '.'))
@@ -569,7 +572,7 @@ class Engine:
   prompt=INSTRUCTIONS+"""
 Custom C++ implementation has now been explicitly approved for the attached plan.
 Return an implementation package for the existing ViboraPhysicsApp, which registers
-the installed MARLINS and MOOSE objects and all retained VIBORA capabilities.
+the installed MOOSE objects (and any configured base application) and all retained VIBORA capabilities.
 Register new objects using registerMooseObject("ViboraPhysicsApp", ClassName).
 Provide NEW .h/.C files only under include/src followed by kernels, materials, bcs,
 auxkernels, functions, userobjects, postprocessors or ics. Do not overwrite existing
@@ -634,19 +637,18 @@ a sufficient test. Tests run serially with a 120-second limit each.
   try:ranks=int(request.get('ranks') or 0)
   except (TypeError,ValueError):raise ValueError('MPI ranks must be a whole number.')
   where=request.get('where') or 'slurm'
-  if where not in ('slurm','login'):raise ValueError('Run location must be a compute node or the login node.')
-  if not 0<=ranks<=(4 if where=='login' else 128):raise ValueError('Login-node runs are limited to 4 MPI ranks.' if where=='login' else 'MPI ranks must be between 1 and 128.')
+  if where not in ('slurm','login'):raise ValueError('Run location must be a compute node or this machine.')
+  if not 0<=ranks<=128:raise ValueError('MPI ranks must be between 1 and 128.')
   wall=str(request.get('time') or '')
   if wall and not re.fullmatch(r'\d{1,2}:\d{2}:\d{2}',wall):raise ValueError('Wall time must look like HH:MM:SS.')
-  if where=='login' and wall and sum(int(x)*f for x,f in zip(wall.split(':'),(3600,60,1)))>3600:raise ValueError('Login-node runs are limited to 01:00:00 wall time.')
   self.update(j,run={'status':'submitting','mode':where,'requested_at':time.time()})
-  self.log(j,'Starting the simulation on the login node.' if where=='login' else 'Submitting the simulation to Slurm.')
+  self.log(j,'Starting the simulation on the MOOSE host itself.' if where=='login' else 'Submitting the simulation to Slurm.')
   try:result=self.rpc({'op':'run_submit','id':j['id'],'input':j['input'],'ranks':ranks,'time':wall,'where':where})
   except Exception as e:
    self.update(j,run={'status':'failed','error':str(e)});self.log(j,'Simulation submission failed: '+str(e)[:400]);raise
   if result.get('mode')=='login':
    self.update(j,run=dict(result,status='running'))
-   self.log(j,'Simulation started on login node '+str(result.get('node'))+' ('+str(result['ranks'])+' MPI ranks, '+str(result['time'])+' limit).')
+   self.log(j,'Simulation started on '+str(result.get('node'))+' ('+str(result['ranks'])+' MPI ranks, '+str(result['time'])+' limit).')
   else:
    self.update(j,run=dict(result,status='queued'))
    self.log(j,'Simulation queued as Slurm job '+str(result['scheduler_id'])+' ('+str(result['ranks'])+' MPI ranks, '+str(result['time'])+' wall time).')
@@ -656,7 +658,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
   j=self.get(request['id'])
   if (j.get('run') or {}).get('status') not in ('queued','running'):raise ValueError('No queued or running simulation to cancel.')
   self.rpc({'op':'run_cancel','id':j['id']})
-  self.log(j,'Cancellation requested for the login-node run.' if j['run'].get('mode')=='login' else 'Cancellation requested for Slurm job '+str(j['run'].get('scheduler_id'))+'.')
+  self.log(j,'Cancellation requested for the run on '+str(j['run'].get('node'))+'.' if j['run'].get('mode')=='login' else 'Cancellation requested for Slurm job '+str(j['run'].get('scheduler_id'))+'.')
   return self.public(j)
  def monitor_run(self,j):
   # Run failures belong to the run, not the validated job, so they are caught here.
@@ -672,7 +674,7 @@ a sufficient test. Tests run serially with a 120-second limit each.
      return
     if state['status']!=run.get('status') or state.get('reason')!=run.get('reason'):
      run.update(state);self.update(j,run=run)
-     self.log(j,'Simulation running on '+('login node ' if state.get('mode')=='login' else '')+str(state.get('node') or 'a compute node')+'.' if state['status']=='running' else 'Waiting for a compute node ('+str(state.get('reason') or 'pending')+').')
+     self.log(j,'Simulation running on '+str(state.get('node') or 'a compute node')+'.' if state['status']=='running' else 'Waiting for a compute node ('+str(state.get('reason') or 'pending')+').')
     time.sleep(10)
   except Exception as e:
    self.update(j,run=dict(j.get('run') or {},status='failed',error=str(e)));self.log(j,'Lost track of the simulation: '+str(e)[:400])

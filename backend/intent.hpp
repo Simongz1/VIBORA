@@ -17,7 +17,7 @@ const std::map<std::string,std::set<std::string>> editable = {
 };
 json resolve_intent(const json& g) {
  const char* port=std::getenv("VIBORA_AGENT_PORT");
- if(!port) throw std::runtime_error("Coding agent is offline. Start scripts/agent_bridge.py on your laptop.");
+ if(!port) throw std::runtime_error("Coding agent is offline. Start scripts/agent_bridge.py (see docs/SETUP.md).");
  httplib::Client agent("127.0.0.1",std::stoi(port));
  agent.set_connection_timeout(3);agent.set_read_timeout(300);agent.set_write_timeout(10);
  httplib::Headers headers;
